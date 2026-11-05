@@ -614,11 +614,16 @@ fn plan_reads(
             coalesced += 1;
         }
         let aligned = (last - first) as usize + floor as usize;
-        let available = size(file).saturating_sub(first) as usize;
+        // A direct-I/O request must stay a whole number of fragments long: the
+        // kernel answers a shortened request with -EINVAL rather than with the
+        // bytes that exist. A source that shrank under the reader is therefore
+        // left to the completion check, which reports the shortfall against
+        // `required`, except where the block no longer exists at all.
+        let vanished = size(file) <= first;
         reads.push(Read {
             file,
             offset: first,
-            nbytes: aligned.min(available),
+            nbytes: if vanished { 0 } else { aligned },
             required,
             fragments: begin..cursor,
         });
@@ -775,6 +780,10 @@ impl DiskReader {
         let staging = MappedRegion::new(depth * CHUNK)?;
         let mut ring = None;
         let mut setup_bits = 0u32;
+        // The last refusal is the one worth reporting: a container without
+        // io_uring privileges fails every rung the same way, and the operator
+        // needs the OS error to tell that from a kernel that lacks the flags.
+        let mut refusal: Option<std::io::Error> = None;
         for &(coop, taskrun_flag) in RING_FLAGS {
             let mut builder = IoUring::builder();
             if coop {
@@ -792,10 +801,23 @@ impl DiskReader {
                 }
                 // Only a rejected setup request steps down a rung; a resource
                 // error is the same error for every rung.
-                Err(_) => continue,
+                Err(error) => refusal = Some(error),
             }
         }
-        let ring = ring.ok_or("create Engram io_uring: no supported setup flags")?;
+        let ring = match ring {
+            Some(ring) => ring,
+            None => {
+                let reason = refusal
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "no supported setup flags".to_string());
+                return Err(format!(
+                    "create Engram io_uring at {depth} slots: {reason}; \
+                     io_uring must be permitted by the kernel and by the container \
+                     seccomp policy (run with --cap-add SYS_ADMIN --security-opt seccomp=unconfined)"
+                )
+                .into());
+            }
+        };
         let descriptors: Vec<_> = (0..depth)
             .map(|slot| libc::iovec {
                 iov_base: staging.at(slot).cast(),
@@ -1952,12 +1974,70 @@ mod tests {
         assert_eq!(reads[0].required, 2560);
         assert_eq!(blocks, 5);
         assert_eq!(coalesced, 1);
-        // A file shorter than the aligned extent clamps the request to real bytes,
-        // and the short read is then reported by the completion check.
-        let mut clamped = Vec::new();
-        let _ = plan_reads(&fragments, &mut clamped, |_| GRAN_MIN as u64, |_| 3000);
-        assert_eq!(clamped[0].nbytes, 440);
-        assert!(clamped[0].required > clamped[0].nbytes);
+        // A source shorter than the aligned extent still gets the whole aligned
+        // request: shortening it would not be a multiple of the fragment floor,
+        // which the kernel rejects for direct I/O with -EINVAL. The completion
+        // check is what reports the shortfall instead.
+        let mut shorter = Vec::new();
+        let _ = plan_reads(&fragments, &mut shorter, |_| GRAN_MIN as u64, |_| 3000);
+        assert_eq!(shorter[0].nbytes, 2560);
+        assert_eq!(shorter[0].nbytes % GRAN_MIN as usize, 0);
+        assert_eq!(shorter[0].required, 2560);
+        // A block that no longer exists at all is requested as nothing, so the
+        // gather reports it rather than reading unrelated bytes.
+        let mut vanished = Vec::new();
+        let _ = plan_reads(&fragments, &mut vanished, |_| GRAN_MIN as u64, |_| 2560);
+        assert_eq!(vanished[0].nbytes, 0);
+    }
+
+    /// A row whose byte length is not a multiple of the fragment floor must still
+    /// be read as whole floor-sized blocks, or `O_DIRECT` answers `-EINVAL`. This
+    /// is the case a 90-byte PLE row in a 720-byte file reaches on a filesystem
+    /// that reports the logical block size as its direct-I/O alignment.
+    #[test]
+    fn reads_always_cover_whole_fragment_blocks() {
+        let rows = 8usize;
+        let planes = [
+            Plane {
+                file: 0,
+                offset: 0,
+                nbytes: rows * 80,
+                row_bytes: 80,
+            },
+            Plane {
+                file: 0,
+                offset: (rows * 80) as u64,
+                nbytes: rows * 10,
+                row_bytes: 10,
+            },
+        ];
+        for floor in [GRAN_MIN, 1024, BLOCK] {
+            let mut output = vec![0; rows * 90];
+            let mut fragments = Vec::new();
+            for (ordinal, plane) in planes.iter().enumerate() {
+                plan_fragments(
+                    plane,
+                    &(0..rows as i64).collect::<Vec<_>>(),
+                    floor,
+                    ordinal * rows * if ordinal == 0 { 80 } else { 10 },
+                    &mut output,
+                    &mut fragments,
+                );
+            }
+            fragments.sort_unstable_by_key(|f| (f.file, f.source));
+            let mut reads = Vec::new();
+            plan_reads(&fragments, &mut reads, |_| floor as u64, |_| u64::MAX);
+            assert!(!reads.is_empty());
+            for read in &reads {
+                assert_eq!(read.offset % floor as u64, 0, "offset follows the floor");
+                assert_eq!(read.nbytes % floor, 0, "length follows the floor");
+                assert!(read.required <= read.nbytes, "a read covers its fragments");
+                for fragment in &fragments[read.fragments.clone()] {
+                    let end = (fragment.source - read.offset) as usize + fragment.nbytes;
+                    assert!(end <= read.nbytes);
+                }
+            }
+        }
     }
 
     #[test]
