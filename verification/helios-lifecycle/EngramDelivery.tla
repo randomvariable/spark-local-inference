@@ -3,17 +3,23 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 \* Bounded model of one disk-backed embedding table's delivery protocol: the
 \* two staging frames fenced by tensor-parallel ranks, the bounded submission
-\* channel that the reader thread serves first, and the bounded advisory
-\* prefetch channel that warms the host row cache without owning a frame. It
-\* checks that no rank, frame, or channel can deadlock, that an advisory batch
-\* can never disturb a frame's generation, and that the reader thread cannot
-\* retire while real gather work is still queued.
+\* channel, the graph's publication of a step's row ids, and the bounded advisory
+\* prefetch channel that warms the host row cache without owning a frame. The
+\* reader thread takes a submission as soon as it arrives but gathers it only
+\* once the step's graph published its ids, and warms the cache while it waits.
+\* It checks that no rank, frame, or channel can deadlock, that an advisory batch
+\* can never disturb a frame's generation, that warming never starts while a
+\* readable gather waits, and that the reader thread cannot retire while real
+\* gather work is still queued or held.
 \*
 \* Correspondence: State::prepare and State::finish plus their rejection
-\* messages, Shared::start's blocking SyncSender::send, CachedReader::gather
-\* and CachedReader::prefetch, the worker loop in Shared::with_readers, and
-\* Transfers::enqueue's wait_value on the frame's ready word. Like RankDispatch
-\* this is a standalone protocol model, not a refinement proof of the threads.
+\* messages, Shared::start's blocking SyncSender::send, Requests::ready,
+\* CachedReader::gather and CachedReader::prefetch, next_work and the worker loop
+\* in Shared::with_readers, and Transfers::enqueue's wait_value on the frame's
+\* ready word. Like RankDispatch this is a standalone protocol model, not a
+\* refinement proof of the threads. Publication is not ordered between steps
+\* here, which only adds behaviours: on the device a step's graph starts after
+\* the previous step's graph finishes.
 
 CONSTANTS
     \* tensor-parallel ranks sharing one table
@@ -57,9 +63,11 @@ Initial ==
       rowCount        |-> [f \in Frames |-> 0],
       published       |-> [f \in Frames |-> 0],
       waiting         |-> [f \in Frames |-> {}],
+      idsReady        |-> [f \in Frames |-> 0],
       queue           |-> <<>>,
       advisoryPending |-> 0,
       offers          |-> 0,
+      held            |-> NoJob,
       job             |-> NoJob,
       worker          |-> Idle,
       parked          |-> FALSE,
@@ -96,6 +104,7 @@ Submit(before, after, rank, seq, rows) ==
              !.completed[f] = IF fresh THEN {} ELSE before.completed[f],
              !.published[f] = IF fresh THEN 0 ELSE before.published[f],
              !.waiting[f] = IF fresh THEN {} ELSE before.waiting[f],
+             !.idsReady[f] = IF fresh THEN 0 ELSE before.idsReady[f],
              !.rowCount[f] = IF fresh THEN rows ELSE before.rowCount[f],
              !.queue = IF fresh
                          THEN Append(before.queue,
@@ -140,16 +149,44 @@ Retire(before, after, rank, seq) ==
        /\ before.published[f] # 0
        /\ after = [before EXCEPT !.completed[f] = before.completed[f] \cup {rank}]
 
-\* The reader thread always prefers a real gather job.
+\* The step's graph writes its row ids to the mailbox and publishes the sequence.
+\* It runs once a rank launched it, independently of the reader thread.
+PublishIds(before, after, f) ==
+    /\ ~before.exited
+    /\ f \in Frames
+    /\ before.stateSeq[f] # 0
+    /\ before.submitted[f] # {}
+    /\ before.idsReady[f] # before.generation[f]
+    /\ after = [before EXCEPT !.idsReady[f] = before.generation[f]]
+
+\* next_work takes the oldest submission into its single held slot as soon as
+\* one arrives, whether or not its ids exist yet.
+Hold(before, after) ==
+    /\ ~before.exited
+    /\ before.worker = Idle
+    /\ before.held = NoJob
+    /\ Len(before.queue) # 0
+    /\ after = [before EXCEPT
+          !.held = Head(before.queue),
+          !.queue = Tail(before.queue),
+          !.parked = FALSE]
+
+\* A gather the thread could start now: a submission it has not taken yet, or a
+\* held one whose ids the graph already published.
+GatherWaiting(s) ==
+    \/ (s.held = NoJob /\ Len(s.queue) # 0)
+    \/ (s.held # NoJob /\ s.idsReady[s.held.frame] = s.held.gen)
+
+\* The reader thread always prefers a readable gather job.
 BeginReal(before, after) ==
     /\ ~before.exited
     /\ before.worker = Idle
-    /\ Len(before.queue) # 0
+    /\ before.held # NoJob
+    /\ before.idsReady[before.held.frame] = before.held.gen
     /\ after = [before EXCEPT
           !.worker = Real,
-          !.job = Head(before.queue),
-          !.queue = Tail(before.queue),
-          !.parked = FALSE]
+          !.job = before.held,
+          !.held = NoJob]
 
 CompleteReal(before, after) ==
     /\ before.worker = Real
@@ -161,18 +198,20 @@ CompleteReal(before, after) ==
                                 THEN before.job.gen
                                 ELSE before.published[f]]]
 
-\* Advisory work is taken only while no real gather waits. `entryBacklog` records
-\* the queue depth at the moment of entry so the priority decision is checkable
-\* after a submission has already joined the queue.
+\* Advisory work is taken only while no gather could start: either nothing is
+\* submitted, or the held submission's graph has not published its ids. The
+\* second case is the replay window read-ahead exists to use. `entryBacklog`
+\* records whether a gather could start at the moment of entry, so the priority
+\* decision is checkable after a submission or publication has followed it.
 BeginAdvisory(before, after) ==
     /\ ~before.exited
     /\ before.worker = Idle
     /\ ~before.parked
-    /\ Len(before.queue) = 0
+    /\ ~GatherWaiting(before)
     /\ before.advisoryPending # 0
     /\ after = [before EXCEPT
           !.worker = Advisory,
-          !.entryBacklog = (Len(before.queue) # 0),
+          !.entryBacklog = GatherWaiting(before),
           !.advisoryPending = before.advisoryPending - 1]
 
 CompleteAdvisory(before, after) ==
@@ -197,13 +236,15 @@ DropAdvisory(before, after) ==
     /\ before.advisoryPending = AdvisoryCapacity
     /\ after = [before EXCEPT !.offers = before.offers + 1]
 
-\* Shared::with_readers. With nothing to pop the thread parks in the blocking
-\* receive. A parked thread still wakes for a real submission because BeginReal
-\* clears the park flag; only the receive timeout wakes it for advisory work.
+\* Shared::with_readers. With nothing held or queued the thread parks on its wake
+\* token. A parked thread still wakes for a real submission because Hold clears
+\* the park flag; only the receive timeout wakes it for advisory work. A held
+\* submission is never parked on: its ids are observed by polling.
 Park(before, after) ==
     /\ ~before.exited
     /\ before.worker = Idle
     /\ ~before.parked
+    /\ before.held = NoJob
     /\ Len(before.queue) = 0
     /\ after = [before EXCEPT !.parked = TRUE]
 
@@ -246,6 +287,7 @@ Exit(before, after) ==
     /\ ~before.exited
     /\ before.worker = Idle
     /\ before.realClosed
+    /\ before.held = NoJob
     /\ Len(before.queue) = 0
     /\ after = [before EXCEPT !.exited = TRUE, !.parked = FALSE]
 
@@ -255,6 +297,8 @@ Next ==
     \/ (\E rank \in Ranks, seq \in Sequences : GraphWait(state, state', rank, seq))
     \/ (\E rank \in Ranks, seq \in Sequences : GraphProceed(state, state', rank, seq))
     \/ (\E rank \in Ranks, seq \in Sequences : Retire(state, state', rank, seq))
+    \/ (\E f \in Frames : PublishIds(state, state', f))
+    \/ Hold(state, state')
     \/ BeginReal(state, state')
     \/ CompleteReal(state, state')
     \/ BeginAdvisory(state, state')
@@ -284,6 +328,7 @@ TypeOK ==
         /\ state.waiting[f] \subseteq Ranks
         /\ state.rowCount[f] \in 0..MaxRows
         /\ state.published[f] \in 0..(RankCount * MaxSequence)
+        /\ state.idsReady[f] \in 0..(RankCount * MaxSequence)
     /\ Len(state.queue) <= RealCapacity
     /\ \A i \in 1..Len(state.queue) :
         /\ state.queue[i].frame \in Frames
@@ -292,6 +337,10 @@ TypeOK ==
          \/ \E f \in Frames, g \in 1..(RankCount * MaxSequence) :
               /\ state.job.frame = f
               /\ state.job.gen = g
+    /\ state.held = NoJob
+         \/ \E f \in Frames, g \in 1..(RankCount * MaxSequence) :
+              /\ state.held.frame = f
+              /\ state.held.gen = g
     /\ state.worker \in {Idle, Real, Advisory}
     /\ state.advisoryPending \in 0..AdvisoryCapacity
     /\ state.offers \in 0..MaxOffers
@@ -327,30 +376,38 @@ OneJobPerGeneration ==
     /\ (state.job # NoJob => \A i \in 1..Len(state.queue) :
             <<state.job.frame, state.job.gen>>
                 # <<state.queue[i].frame, state.queue[i].gen>>)
+    /\ (state.held # NoJob => \A i \in 1..Len(state.queue) :
+            <<state.held.frame, state.held.gen>>
+                # <<state.queue[i].frame, state.queue[i].gen>>)
+    /\ (state.held # NoJob /\ state.job # NoJob =>
+            <<state.held.frame, state.held.gen>> # <<state.job.frame, state.job.gen>>)
 
-\* A queued or in-flight job always names the generation its frame holds, so a
-\* stale gather can never publish into a reused frame.
+\* A queued, held, or in-flight job always names the generation its frame holds,
+\* so a stale gather can never publish into a reused frame.
 InFlightMatchesGeneration ==
     /\ \A i \in 1..Len(state.queue) :
          state.queue[i].gen = state.generation[state.queue[i].frame]
     /\ state.job # NoJob => state.job.gen = state.generation[state.job.frame]
+    /\ state.held # NoJob => state.held.gen = state.generation[state.held.frame]
 
 \* A published value is always a generation that frame actually holds, so an
 \* advisory batch cannot release a waiting graph.
 PublishedIsCurrentGeneration ==
     \A f \in Frames : state.published[f] # 0 => state.published[f] = state.generation[f]
 
-\* The reader thread never begins advisory work while a gather waits. The entry
-\* record makes the decision checkable after a submission joins the queue.
+\* The reader thread never begins advisory work while a gather could start. The
+\* entry record makes the decision checkable after a later submission or
+\* publication.
 NoAdvisoryUnderRealBacklog ==
     state.worker = Advisory => ~state.entryBacklog
 
 \* Shutdown cannot strand real work: the thread exits only with an empty
-\* submission channel, no job in hand, and a closed submission sender.
+\* submission channel, nothing held or in hand, and a closed submission sender.
 ExitedOnlyWhenDrained ==
     state.exited =>
         /\ Len(state.queue) = 0
         /\ state.worker = Idle
+        /\ state.held = NoJob
         /\ state.job = NoJob
         /\ state.realClosed
 
@@ -362,9 +419,11 @@ AdvisoryNeverOwnsFrame ==
 
 \* Liveness. With bounded sequences and offers, and fair worker actions, every
 \* queued gather is published and every accepted advisory batch is handled.
-Drained == Len(state.queue) = 0 /\ state.worker = Idle /\ state.job = NoJob
+Drained == Len(state.queue) = 0 /\ state.worker = Idle /\ state.held = NoJob
+           /\ state.job = NoJob
 AdvisoryHandled == state.advisoryPending = 0
 ProgressActions ==
+    \/ Hold(state, state')
     \/ BeginReal(state, state')
     \/ CompleteReal(state, state')
     \/ BeginAdvisory(state, state')
@@ -381,7 +440,10 @@ Liveness ==
     /\ <>[](state.exited \/ AdvisoryHandled)
     /\ (state.realClosed /\ state.advisoryClosed => <> state.exited)
 
+\* A launched graph eventually runs and publishes its ids: without that
+\* environment assumption a held gather could wait forever.
 Spec == Init /\ [][Next]_state /\ WF_state(ProgressActions)
              /\ WF_state(Exit(state, state'))
+             /\ \A f \in Frames : WF_state(PublishIds(state, state', f))
 
 =============================================================================

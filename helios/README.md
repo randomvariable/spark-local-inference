@@ -529,8 +529,13 @@ then halved on refusal, so the depth that landed is reported rather than assumed
 evictions, occupancy, capacity and bytes, both as host-wide totals and as one
 labelled `flare_engram_table_*` series per table and declared layer, including the
 reader's queue depth, fragment floor, accepted setup flags, and registered-file
-state. The same cache is warmed ahead of a step by advisory prefetch; see
-[the serving option](../docs/cli-design.md) for its counters and limits.
+state. A gather serving more than 4096 cached rows copies them into the staging
+frame on four threads, because a prefill chunk's hits are hundreds of megabytes and
+the graph waits on that copy. The same cache is warmed ahead of a step by advisory
+prefetch, which reads prefill prompts ahead of the graph. A row read ahead is admitted without the usage
+test and cannot be evicted until it is used or one full turnover of cache
+operations passes; see [the serving option](../docs/cli-design.md) for its counters
+and limits.
 
 ## Prefix checkpoint policy
 

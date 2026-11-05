@@ -26,10 +26,6 @@ use crate::{
     },
 };
 
-/// Prompt tokens one step may have warmed, matching the bound upstream gives its
-/// prefetcher so a long prefill chunk cannot crowd later steps out of the queue.
-const PREFETCH_LOOKAHEAD_TOKENS: usize = 2048;
-
 pub struct Prompt {
     pub tokens: Vec<u32>,
     /// Sorted token counts of exact rendered message prefixes.
@@ -949,6 +945,14 @@ struct Worker<'a> {
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
     /// Reused predicted-row buffer, so the submission path allocates nothing.
     prefetch_scratch: Vec<i64>,
+    /// Per table, the rows predicted for the step being submitted, left for the
+    /// reader threads to check against what the graph publishes.
+    prefetch_expected: Vec<Vec<i64>>,
+    /// Per request slot, the prompt position through which embedding rows were
+    /// handed to the readers ahead of the graph, for the request occupying it.
+    read_ahead: Vec<Option<(RequestHandle, usize)>>,
+    /// Per table, the read-ahead tokens the step's prefill lanes have left to share.
+    read_ahead_budget: Vec<usize>,
 }
 
 impl<'a> Worker<'a> {
@@ -981,6 +985,9 @@ impl<'a> Worker<'a> {
             prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
             prefetch_scratch: Vec::new(),
+            prefetch_expected: Vec::new(),
+            read_ahead: (0..config.limits.max_active).map(|_| None).collect(),
+            read_ahead_budget: Vec::new(),
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
@@ -2068,34 +2075,52 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    /// Hand the rows the launching step will request to the embedding reader
-    /// threads before the graph is launched, so the disk read overlaps the
-    /// previous step instead of gating this one.
+    /// Hand embedding rows to the reader threads ahead of the graphs that request
+    /// them, so disk reads overlap replay instead of gating it.
     ///
-    /// The graph stays the authority: it publishes the ids its own lookup
-    /// consumes, and the real gather still reads them. A prediction that does not
-    /// match wastes disk bandwidth and nothing else, and
-    /// `flare_engram_prediction_mismatches_total` reports the disagreement.
+    /// A table's ids are published by the graph itself, so without this its rows
+    /// are read only once the step is already running and every row miss stalls
+    /// the GPU. Prompt positions are host-known from admission, so a prefill lane
+    /// is read ahead past the launching chunk, from where the previous step left
+    /// off, within a read-ahead budget per table that the step's prefill lanes
+    /// share in lane order, and the readers keep the disk busy through each
+    /// step's replay. A decode, speculative, or mixed lane hands over its pending
+    /// token, but only when no step is in flight: a pipelined step's input comes
+    /// from the previous step's device output. Drafts beyond it are not
+    /// predicted: copied-token proposals arrive as host-chosen ids from another
+    /// source and MTP drafts are produced inside the graph, so their rows are
+    /// requested the ordinary way.
     ///
-    /// Predictable from host state alone: every prompt position of a prefill lane
-    /// and the pending token of a decode, speculative, or mixed lane. Drafts
-    /// beyond that pending token are not predicted - copied-token proposals
-    /// arrive as host-chosen i64 ids from a different source and MTP drafts are
-    /// produced inside the graph - so those rows are requested the ordinary way.
-    /// That is the ceiling of this advisory path.
+    /// The graph stays the authority: it publishes the ids its own lookup consumes
+    /// and the real gather still reads them. A wrong prediction wastes disk
+    /// bandwidth and nothing else, and `flare_engram_prediction_mismatches_total`
+    /// counts steps whose predicted rows the graph did not publish. A prefill lane
+    /// contributes one batch of its own positions to that check, which suffices
+    /// for a systematic derivation error and keeps the scheduler thread from
+    /// sorting a whole chunk.
     fn prefetch_rows(&mut self, executor: &RankExecutor, step: &ScheduledPlan, sequence: u64) {
         let Some(binding) = executor.manifest().engram.as_ref() else {
             return;
         };
-        if !crate::engram::consumes(step.kind) || executor.outstanding() >= 2 {
-            // Two frames are already in flight: the reader threads are busy and
-            // advisory work would only queue behind them.
+        let shared = &binding.shared;
+        if !crate::engram::consumes(step.kind) || !shared.prefetching() {
             return;
         }
-        let shared = binding.shared.clone();
         let tables = shared.index.tables.len();
-        let stats = shared.stats();
-        let mut handed = false;
+        self.prefetch_expected.resize_with(tables, Vec::new);
+        // A decode lane's input is host-known only once every earlier step's
+        // completion has been observed. A step submitted while another is in
+        // flight takes its input from that step's device output, and the host's
+        // pending token is still the previous step's: predicting from it reads
+        // the rows the previous step already used. Prompt positions are fixed at
+        // admission, so prefill lanes are predictable either way.
+        let decode_known = executor.outstanding() == 0;
+        // Each table's read-ahead bound covers every prompt in the step together:
+        // several requests prefilling at once must not each pin a full budget.
+        self.read_ahead_budget.clear();
+        self.read_ahead_budget
+            .extend((0..tables).map(|table| shared.read_ahead_tokens(table)));
+        let mut refused = false;
         for (row, lane) in step.lanes.iter().enumerate() {
             let slot = lane.request.slot as usize;
             let Some(Some(admission)) = self.admissions.get(slot) else {
@@ -2105,44 +2130,66 @@ impl<'a> Worker<'a> {
                 continue;
             };
             let tokens = live.tokens();
-            let prefill = step.lane_kind(row).is_prefill();
-            let first = if prefill {
-                lane.start_position as usize
-            } else {
-                live.consumed_tokens as usize
-            };
-            // Upstream caps the rows one step may queue for warming, so a long
-            // prompt chunk cannot fill the advisory queue ahead of later steps.
-            let queries = if prefill {
-                lane.tokens.min(PREFETCH_LOOKAHEAD_TOKENS)
-            } else {
-                1
-            };
-            let Some(end) = first.checked_add(queries) else {
-                continue;
-            };
-            if tokens.len() < end || queries == 0 {
+            let excluded = |position| admission.data.is_image_position(position);
+            let scratch = &mut self.prefetch_scratch;
+            if !step.lane_kind(row).is_prefill() {
+                if !decode_known {
+                    continue;
+                }
+                let first = live.consumed_tokens as usize;
+                for table in 0..tables {
+                    scratch.clear();
+                    shared.predict_rows(table, tokens, first, first + 1, excluded, scratch);
+                    self.prefetch_expected[table].extend_from_slice(scratch);
+                    refused |= !scratch.is_empty() && !shared.prefetch(table, scratch);
+                }
                 continue;
             }
-            let scratch = &mut self.prefetch_scratch;
+            let first = lane.start_position as usize;
+            let launched = (first + lane.tokens).min(tokens.len());
+            let progress = match self.read_ahead.get(slot) {
+                Some(Some((request, end))) if *request == lane.request => (*end).max(first),
+                _ => first,
+            };
+            let mut reached = usize::MAX;
             for table in 0..tables {
-                let depth = shared.history_depth(table);
-                let base = first.saturating_sub(depth - 1);
-                let Some(window) = tokens.get(base..end) else {
-                    continue;
-                };
-                handed |= shared.predict(
+                let batch = shared.batch_tokens(table);
+                shared.predict_rows(
                     table,
-                    sequence,
-                    window,
-                    queries,
-                    base,
-                    |position| admission.data.is_image_position(position),
-                    scratch,
+                    tokens,
+                    first,
+                    (first + batch).min(launched),
+                    excluded,
+                    &mut self.prefetch_expected[table],
                 );
+                // Never stop short of the launching chunk: its rows are needed now.
+                let share = self.read_ahead_budget[table];
+                let limit = (first + share).max(launched).min(tokens.len());
+                let mut position = progress;
+                while position < limit {
+                    let end = (position + batch).min(limit);
+                    scratch.clear();
+                    shared.predict_rows(table, tokens, position, end, excluded, scratch);
+                    if !scratch.is_empty() && !shared.prefetch(table, scratch) {
+                        refused = true;
+                        break;
+                    }
+                    position = end;
+                }
+                reached = reached.min(position);
+                // Rows queued in earlier steps still occupy the cache until used,
+                // so the lane's whole extent past the graph's position counts.
+                self.read_ahead_budget[table] = share.saturating_sub(position - first);
+            }
+            if let Some(entry) = self.read_ahead.get_mut(slot) {
+                *entry = Some((lane.request, reached));
             }
         }
-        stats.record_submission(handed);
+        for (table, expected) in self.prefetch_expected.iter_mut().enumerate() {
+            shared.expect(table, sequence, expected);
+            expected.clear();
+        }
+        shared.stats().record_submission(!refused);
     }
 
     fn submit(&mut self, executor: &mut RankExecutor, step: &ScheduledPlan) -> Result<bool> {

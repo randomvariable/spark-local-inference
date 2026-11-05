@@ -510,30 +510,62 @@ impl Drop for Aligned {
 }
 
 pub(crate) struct DiskReader {
-    // Destroying the ring cancels and drains outstanding I/O before the buffers are freed.
+    /// One ring per submitting thread, together holding the reader's queue and
+    /// staging budget. Some drives only reach their random-read rate with many
+    /// submitters: the same total depth spread over more threads, and so more
+    /// device queues, can complete several times the reads.
     #[cfg(unix)]
-    ring: IoUring,
+    lanes: Vec<Lane>,
     #[cfg(windows)]
     windows: windows::Readers,
-    #[cfg(unix)]
-    staging: MappedRegion,
     #[cfg(windows)]
     files: Vec<Arc<File>>,
     /// Per-source facts the planner needs: file length and fragment floor.
     #[cfg(unix)]
     meta: Vec<FileMeta>,
-    #[cfg(unix)]
-    depth: usize,
-    /// Slots not currently holding an in-flight read, popped from the back.
-    #[cfg(unix)]
-    free: Vec<u16>,
-    /// Read index each in-flight slot carries.
-    #[cfg(unix)]
-    slot_job: Vec<usize>,
     fragments: Vec<Fragment>,
     reads: Vec<Read>,
     resident_scales: Option<Resident>,
     counters: Arc<TableCounters>,
+}
+
+/// One io_uring with its registered staging slots, driven by one thread at a time.
+#[cfg(unix)]
+struct Lane {
+    // Destroying the ring cancels and drains outstanding I/O before the buffers are freed.
+    ring: IoUring,
+    staging: MappedRegion,
+    depth: usize,
+    /// Slots not currently holding an in-flight read, popped from the back.
+    free: Vec<u16>,
+    /// Read index each in-flight slot carries.
+    slot_job: Vec<usize>,
+}
+
+/// The gather output, shared by lanes that each write their own reads' bytes.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct Output {
+    address: usize,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl Output {
+    // SAFETY: The planner assigns each destination byte to exactly one fragment,
+    // and each read with its fragments belongs to one lane. The scoped join
+    // finishes every lane before the caller can access or release the output.
+    unsafe fn copy(self, fragment: &Fragment, source: *const u8) {
+        assert!(fragment.destination <= self.len);
+        assert!(fragment.nbytes <= self.len - fragment.destination);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source,
+                (self.address as *mut u8).add(fragment.destination),
+                fragment.nbytes,
+            );
+        }
+    }
 }
 
 /// Split each requested row into pieces no wider than the file's fragment floor,
@@ -720,11 +752,10 @@ impl Drop for DiskTimings<'_> {
 impl DiskReader {
     fn from_files(files: &[Arc<File>], counters: Arc<TableCounters>, workers: usize) -> Result<Self> {
         #[cfg(unix)]
-        if workers != 1 {
-            return Err("parallel embedding disk workers require Windows".into());
-        }
-        #[cfg(unix)]
         {
+            if !matches!(workers, 1 | 2 | 4 | 8) {
+                return Err("embedding table workers must be 1, 2, 4, or 8".into());
+            }
             // One probe per source: the file length clamps a coalesced read to
             // real bytes, and the direct-I/O alignment sets the fragment floor.
             let meta = files
@@ -737,15 +768,19 @@ impl DiskReader {
                     Ok(FileMeta { bytes, gran: dio_gran(file) })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Workers share the requested depth, as on Windows: more submitters,
+            // the same reads in flight and the same pinned staging.
             let requested = QUEUE_DEPTH_DEFAULT;
-            let mut depth = start_depth(requested, slot_budget(requested));
+            let mut depth =
+                start_depth(requested / workers, slot_budget(requested) / workers);
             // Registered buffers are pinned and charged against the locked-memory
             // limit, which is a per-process budget shared with every other ring,
             // so registration is the only authoritative answer: on refusal, halve
             // the queue rather than failing the reader. A shallower ring is slower
             // but correct, and the reported depth is the one that landed.
             loop {
-                match Self::configure(depth, requested, files, meta.clone(), counters.clone()) {
+                match Self::configure(depth, workers, requested, files, meta.clone(), counters.clone())
+                {
                     Ok(reader) => return Ok(reader),
                     // At the floor the refusal is fatal, and the caller reports it.
                     Err(error) => depth = shallower(depth).ok_or(error)?,
@@ -766,17 +801,64 @@ impl DiskReader {
         }
     }
 
-    /// Allocate and register everything one queue depth needs, or fail without
-    /// leaving a ring, pinned buffers, or a dangling mapping behind, so the
-    /// caller can simply retry at half the slots.
+    /// Allocate and register every lane at one per-lane queue depth, or fail
+    /// without leaving a ring, pinned buffers, or a dangling mapping behind, so
+    /// the caller can simply retry at half the slots.
     #[cfg(unix)]
     fn configure(
         depth: usize,
+        workers: usize,
         depth_requested: usize,
         files: &[Arc<File>],
         meta: Vec<FileMeta>,
         counters: Arc<TableCounters>,
     ) -> Result<Self> {
+        let mut lanes = Vec::with_capacity(workers);
+        let mut setup_bits = 0u32;
+        let mut fixed_files = true;
+        for _ in 0..workers {
+            let (lane, bits, fixed) = Lane::new(depth, files)?;
+            lanes.push(lane);
+            setup_bits = bits;
+            fixed_files &= fixed;
+        }
+        // Every value here describes the rings that finally came up, so a halving
+        // retry must overwrite rather than accumulate.
+        counters
+            .disk_staging_bytes
+            .store((workers * depth * CHUNK) as u64, Ordering::Relaxed);
+        counters
+            .disk_queue_depth
+            .store((workers * depth) as u64, Ordering::Relaxed);
+        counters
+            .disk_queue_depth_requested
+            .store(depth_requested as u64, Ordering::Relaxed);
+        counters.disk_alignment_bytes.store(
+            meta.iter().map(|entry| entry.gran).min().unwrap_or(BLOCK) as u64,
+            Ordering::Relaxed,
+        );
+        counters
+            .disk_uring_flags
+            .store(u64::from(setup_bits), Ordering::Relaxed);
+        counters
+            .disk_fixed_files
+            .store(u64::from(fixed_files), Ordering::Relaxed);
+        Ok(Self {
+            lanes,
+            meta,
+            fragments: Vec::new(),
+            reads: Vec::new(),
+            resident_scales: None,
+            counters,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Lane {
+    /// Bring up one ring at `depth` slots with its registered staging and files,
+    /// returning the setup flags that landed and whether files are registered.
+    fn new(depth: usize, files: &[Arc<File>]) -> Result<(Self, u32, bool)> {
         let staging = MappedRegion::new(depth * CHUNK)?;
         let mut ring = None;
         let mut setup_bits = 0u32;
@@ -836,41 +918,131 @@ impl DiskReader {
         // keeps submitting raw descriptors, and the gauge records which path landed.
         let raw: Vec<_> = files.iter().map(|file| file.as_raw_fd()).collect();
         let fixed_files = ring.submitter().register_files(&raw).is_ok();
-        // Every value here describes the ring that finally came up, so a halving
-        // retry must overwrite rather than accumulate.
-        counters
-            .disk_staging_bytes
-            .store(depth as u64 * CHUNK as u64, Ordering::Relaxed);
-        counters
-            .disk_queue_depth
-            .store(depth as u64, Ordering::Relaxed);
-        counters
-            .disk_queue_depth_requested
-            .store(depth_requested as u64, Ordering::Relaxed);
-        counters.disk_alignment_bytes.store(
-            meta.iter().map(|entry| entry.gran).min().unwrap_or(BLOCK) as u64,
-            Ordering::Relaxed,
-        );
-        counters
-            .disk_uring_flags
-            .store(u64::from(setup_bits), Ordering::Relaxed);
-        counters
-            .disk_fixed_files
-            .store(u64::from(fixed_files), Ordering::Relaxed);
-        Ok(Self {
+        let lane = Self {
             ring,
             staging,
-            meta,
             depth,
             free: (0..depth as u16).rev().collect(),
             slot_job: vec![0; depth],
-            fragments: Vec::new(),
-            reads: Vec::new(),
-            resident_scales: None,
-            counters,
-        })
+        };
+        Ok((lane, setup_bits, fixed_files))
     }
 
+    /// Submit `reads` through this ring and copy each completion's fragments into
+    /// `output`, keeping the ring saturated wave by wave.
+    fn run(
+        &mut self,
+        reads: &[Read],
+        fragments: &[Fragment],
+        output: Output,
+        stats: &TableCounters,
+    ) -> Result<()> {
+        let mut timing = DiskTimings {
+            stats,
+            plan: 0,
+            submit: 0,
+            wait: 0,
+            complete: 0,
+        };
+        // Every slot is free at the start of a run: one thread drives the ring at
+        // a time, and a previous run either reaped each read it armed or returned
+        // an error that cancelled the table. Re-issuing the list keeps a failed
+        // run from leaking slots into later ones.
+        self.free.clear();
+        self.free.extend((0..self.depth as u16).rev());
+        let mut armed = 0usize;
+        let mut next = 0usize;
+        let mut failure: Option<crate::Error> = None;
+        while next < reads.len() || armed != 0 {
+            // Refill from every slot the previous reap handed back, so the queue
+            // stays saturated across the wave instead of one completion at a
+            // time. Once a read failed, stop arming: an I/O error then leaves no
+            // speculative refill entries, and the already-submitted reads are
+            // still drained before returning.
+            let mut prepared = 0usize;
+            while failure.is_none() && next < reads.len() && !self.free.is_empty() {
+                let slot = self.free.pop().expect("checked non-empty");
+                let read = reads[next].clone();
+                self.slot_job[slot as usize] = next;
+                next += 1;
+                let entry = opcode::ReadFixed::new(
+                    types::Fixed(read.file as u32),
+                    self.staging.at(slot as usize),
+                    read.nbytes as u32,
+                    slot,
+                )
+                .offset(read.offset)
+                .build()
+                .user_data(slot as u64);
+                // SAFETY: The ring has `depth` entries and at most `depth` slots
+                // are handed out, so the submission queue has room.
+                match unsafe { self.ring.submission().push(&entry) } {
+                    Ok(()) => prepared += 1,
+                    Err(_) => failure = Some("Engram submission queue full".into()),
+                }
+            }
+            armed += prepared;
+            if armed == 0 {
+                break;
+            }
+            // One enter submits the whole armed wave and blocks until half the
+            // ring is ready to refill, replacing wait-one-CQE granularity that
+            // left the device idle between reaps.
+            let begin = Instant::now();
+            let wait = armed.min(self.depth / 2).max(1);
+            let submitted = self.ring.submit_and_wait(wait);
+            timing.wait += begin.elapsed().as_nanos() as u64;
+            stats.disk_submit_calls.fetch_add(1, Ordering::Relaxed);
+            match submitted {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(format!("submit Engram reads: {error}").into()),
+            }
+            let begin = Instant::now();
+            {
+                let mut completion = self.ring.completion();
+                while armed != 0 {
+                    let Some(entry) = completion.next() else { break };
+                    armed -= 1;
+                    let slot = entry.user_data() as usize;
+                    self.free.push(slot as u16);
+                    let read = reads[self.slot_job[slot]].clone();
+                    stats.disk_read_calls.fetch_add(1, Ordering::Relaxed);
+                    let count = entry.result();
+                    if count < 0 || (count as usize) < read.required {
+                        if failure.is_none() {
+                            failure = Some(
+                                format!(
+                                    "Engram read at {} returned {count}, requires {} bytes",
+                                    read.offset, read.required
+                                )
+                                .into(),
+                            );
+                        }
+                        continue;
+                    }
+                    stats.disk_read_bytes.fetch_add(count as u64, Ordering::Relaxed);
+                    for fragment in &fragments[read.fragments.clone()] {
+                        // SAFETY: the fragment lies inside this read's completed
+                        // bytes in the slot, and the destination is its own.
+                        unsafe {
+                            output.copy(
+                                fragment,
+                                self.staging
+                                    .at(slot)
+                                    .add((fragment.source - read.offset) as usize),
+                            );
+                        }
+                    }
+                }
+            }
+            timing.complete += begin.elapsed().as_nanos() as u64;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl DiskReader {
     pub fn gather(&mut self, planes: &[Plane; 2], ids: &[i64], output: &mut [u8]) -> Result<()> {
         let mut timing = DiskTimings {
             stats: &self.counters,
@@ -920,113 +1092,45 @@ impl DiskReader {
             self.reads.iter().map(|read| read.nbytes as u64).sum(),
             Ordering::Relaxed,
         );
+        drop(timing);
         #[cfg(unix)]
         {
-            // Every slot is free at the start of a gather: this thread owns the ring,
-            // and a previous gather either reaped each read it armed or returned an
-            // error that cancelled the table. Re-issuing the list keeps a failed
-            // gather from leaking slots into later ones.
-            self.free.clear();
-            self.free.extend((0..self.depth as u16).rev());
-            let mut armed = 0usize;
-            let mut next = 0usize;
-            let mut failure: Option<crate::Error> = None;
-            while next < self.reads.len() || armed != 0 {
-                // Refill from every slot the previous reap handed back, so the
-                // queue stays saturated across the wave instead of one
-                // completion at a time. Once a read failed, stop arming: an I/O
-                // error then leaves no speculative refill entries, and the
-                // already-submitted reads are still drained before returning.
-                let mut prepared = 0usize;
-                while failure.is_none() && next < self.reads.len() && !self.free.is_empty() {
-                    let slot = self.free.pop().expect("checked non-empty");
-                    let read = self.reads[next].clone();
-                    self.slot_job[slot as usize] = next;
-                    next += 1;
-                    let entry = opcode::ReadFixed::new(
-                        types::Fixed(read.file as u32),
-                        self.staging.at(slot as usize),
-                        read.nbytes as u32,
-                        slot,
-                    )
-                    .offset(read.offset)
-                    .build()
-                    .user_data(slot as u64);
-                    // SAFETY: The ring has `depth` entries and at most `depth`
-                    // slots are handed out, so the submission queue has room.
-                    match unsafe { self.ring.submission().push(&entry) } {
-                        Ok(()) => prepared += 1,
-                        Err(_) => failure = Some("Engram submission queue full".into()),
-                    }
-                }
-                armed += prepared;
-                if armed == 0 {
-                    break;
-                }
-                // One enter submits the whole armed wave and blocks until half
-                // the ring is ready to refill, replacing wait-one-CQE granularity
-                // that left the device idle between reaps.
-                let begin = Instant::now();
-                let wait = armed.min(self.depth / 2).max(1);
-                let submitted = self.ring.submit_and_wait(wait);
-                timing.wait += begin.elapsed().as_nanos() as u64;
-                self.counters
-                    .disk_submit_calls
-                    .fetch_add(1, Ordering::Relaxed);
-                match submitted {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        return Err(format!("submit Engram reads: {error}").into());
-                    }
-                }
-                let begin = Instant::now();
-                {
-                    let mut completion = self.ring.completion();
-                    while armed != 0 {
-                        let Some(entry) = completion.next() else { break };
-                        armed -= 1;
-                        let slot = entry.user_data() as usize;
-                        self.free.push(slot as u16);
-                        let read = self.reads[self.slot_job[slot]].clone();
-                        self.counters
-                            .disk_read_calls
-                            .fetch_add(1, Ordering::Relaxed);
-                        let count = entry.result();
-                        if count < 0 || (count as usize) < read.required {
-                            if failure.is_none() {
-                                failure = Some(
-                                    format!(
-                                        "Engram read at {} returned {count}, requires {} bytes",
-                                        read.offset, read.required
-                                    )
-                                    .into(),
-                                );
-                            }
-                            continue;
-                        }
-                        self.counters
-                            .disk_read_bytes
-                            .fetch_add(count as u64, Ordering::Relaxed);
-                        for fragment in &self.fragments[read.fragments.clone()] {
-                            let source = unsafe {
-                                std::slice::from_raw_parts(
-                                    self.staging
-                                        .at(slot)
-                                        .add((fragment.source - read.offset) as usize),
-                                    fragment.nbytes,
-                                )
-                            };
-                            output[fragment.destination..fragment.destination + fragment.nbytes]
-                                .copy_from_slice(source);
-                        }
-                    }
-                }
-                timing.complete += begin.elapsed().as_nanos() as u64;
+            let output = Output {
+                address: output.as_mut_ptr() as usize,
+                len: output.len(),
+            };
+            let (reads, fragments, stats) = (&self.reads, &self.fragments, &*self.counters);
+            // Gathers one ring can hold stay on the delivery thread. Larger ones,
+            // such as a prefill chunk or an advisory batch, split their sorted
+            // reads into contiguous runs, one per lane on its own thread.
+            if self.lanes.len() == 1 || reads.len() <= self.lanes[0].depth {
+                return self.lanes[0].run(reads, fragments, output, stats);
             }
-            if let Some(error) = failure {
-                return Err(error);
-            }
+            let chunk = reads.len().div_ceil(self.lanes.len());
+            std::thread::scope(|scope| {
+                let (local, helpers) = self.lanes.split_first_mut().unwrap();
+                let mut jobs = reads.chunks(chunk);
+                let first = jobs.next().unwrap();
+                let mut joins = Vec::with_capacity(helpers.len());
+                for (index, (lane, reads)) in helpers.iter_mut().zip(jobs).enumerate() {
+                    joins.push(
+                        std::thread::Builder::new()
+                            .name(format!("flare-table-io-{}", index + 1))
+                            .spawn_scoped(scope, move || lane.run(reads, fragments, output, stats))
+                            .map_err(|e| format!("start embedding read worker: {e}"))?,
+                    );
+                }
+                let mut result = local.run(first, fragments, output, stats);
+                for worker in joins {
+                    let next = worker
+                        .join()
+                        .unwrap_or_else(|_| Err("embedding read worker panicked".into()));
+                    if result.is_ok() {
+                        result = next;
+                    }
+                }
+                result
+            })?;
         }
         #[cfg(windows)]
         self.windows
@@ -1036,14 +1140,73 @@ impl DiskReader {
     }
 }
 
+/// Hits a gather copies on the calling thread alone. Larger gathers, such as a
+/// prefill chunk served from read-ahead rows, split the copy across
+/// `COPY_THREADS`: the graph waits on that copy, and one core moves rows at a
+/// fraction of host memory bandwidth.
+const PARALLEL_COPY_ROWS: usize = 4096;
+const COPY_THREADS: usize = 4;
+
 struct CachedReader {
     disk: DiskReader,
     cache: RowCache,
     requests: Vec<(i64, usize)>,
     miss_ids: Vec<i64>,
     miss_groups: Vec<(usize, usize)>,
+    /// Cached row address and request range of every hit in the current gather.
+    hit_groups: Vec<(usize, usize, usize)>,
     miss_output: Vec<u8>,
     max_rows: usize,
+}
+
+/// Copy each hit's cached row into every output row that requested it.
+///
+/// The request groups partition the output rows, so groups split across threads
+/// write disjoint ranges; cached rows are only read while the cache is not
+/// mutated, and the caller copies hits before inserting any miss.
+fn copy_hits(
+    hits: &[(usize, usize, usize)],
+    requests: &[(i64, usize)],
+    output: &mut [u8],
+    [weights, scales]: [usize; 2],
+) {
+    let scale_base = output.len() / (weights + scales) * weights;
+    let base = output.as_mut_ptr() as usize;
+    let copy = |part: &[(usize, usize, usize)]| {
+        for &(source, begin, end) in part {
+            // SAFETY: `source` addresses one resident row of `weights + scales`
+            // bytes that no thread writes during the copy.
+            let row = unsafe { std::slice::from_raw_parts(source as *const u8, weights + scales) };
+            for &(_, target) in &requests[begin..end] {
+                // SAFETY: `target` is below the gather's row count, and no other
+                // group names the same output row.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        (base + target * weights) as *mut u8,
+                        weights,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        row.as_ptr().add(weights),
+                        (base + scale_base + target * scales) as *mut u8,
+                        scales,
+                    );
+                }
+            }
+        }
+    };
+    if hits.len() < PARALLEL_COPY_ROWS {
+        copy(hits);
+        return;
+    }
+    std::thread::scope(|scope| {
+        let mut parts = hits.chunks(hits.len().div_ceil(COPY_THREADS));
+        let local = parts.next().unwrap_or(&[]);
+        for part in parts {
+            scope.spawn(move || copy(part));
+        }
+        copy(local);
+    });
 }
 
 impl CachedReader {
@@ -1062,6 +1225,7 @@ impl CachedReader {
                 size_of::<(i64, usize)>()
                     + size_of::<i64>()
                     + size_of::<(usize, usize)>()
+                    + size_of::<(usize, usize, usize)>()
                     + row_bytes,
             )
             .and_then(|n| n.checked_add(size_of::<Self>()))
@@ -1084,9 +1248,11 @@ impl CachedReader {
         let mut requests = allocated(max_rows, (0i64, 0usize))?;
         let mut miss_ids = allocated(max_rows, 0i64)?;
         let mut miss_groups = allocated(max_rows, (0usize, 0usize))?;
+        let mut hit_groups = allocated(max_rows, (0usize, 0usize, 0usize))?;
         requests.clear();
         miss_ids.clear();
         miss_groups.clear();
+        hit_groups.clear();
         let miss_output = allocated(max_rows * row_bytes, 0u8)?;
         let cache = RowCache::new(
             payload_budget,
@@ -1106,6 +1272,7 @@ impl CachedReader {
             requests,
             miss_ids,
             miss_groups,
+            hit_groups,
             miss_output,
             max_rows,
         })
@@ -1129,25 +1296,26 @@ impl CachedReader {
             }
         }
         self.requests.sort_unstable_by_key(|&(id, _)| id);
+        self.hit_groups.clear();
         let mut begin = 0;
-        let mut hits = 0;
         while begin < self.requests.len() {
             let id = self.requests[begin].0;
             let end = begin + self.requests[begin..].partition_point(|&(next, _)| next == id);
             if let Some(payload) = self.cache.get(id) {
-                hits += 1;
-                for &(_, row) in &self.requests[begin..end] {
-                    output[row * weights..(row + 1) * weights].copy_from_slice(&payload[..weights]);
-                    output[scale_base + row * scales..scale_base + (row + 1) * scales]
-                        .copy_from_slice(&payload[weights..]);
-                }
+                self.hit_groups.push((payload.as_ptr() as usize, begin, end));
             } else {
                 self.miss_ids.push(id);
                 self.miss_groups.push((begin, end));
             }
             begin = end;
         }
-        self.disk.counters.hits.fetch_add(hits, Ordering::Relaxed);
+        // Every hit is copied before any miss enters the cache, so an insertion
+        // cannot replace a row that is still being copied.
+        copy_hits(&self.hit_groups, &self.requests, output, [weights, scales]);
+        self.disk
+            .counters
+            .hits
+            .fetch_add(self.hit_groups.len() as u64, Ordering::Relaxed);
         self.disk
             .counters
             .misses
@@ -1208,7 +1376,9 @@ impl CachedReader {
         );
         self.miss_ids.sort_unstable();
         self.miss_ids.dedup();
-        self.miss_ids.retain(|&id| self.cache.get(id).is_none());
+        // A resident row is pinned for its upcoming use rather than counted as one:
+        // the gather that consumes it counts the use.
+        self.miss_ids.retain(|&id| !self.cache.pin(id));
         if self.miss_ids.len() > self.max_rows {
             self.disk
                 .counters
@@ -1231,9 +1401,10 @@ impl CachedReader {
             let w = &self.miss_output[index * weights..(index + 1) * weights];
             let s = &self.miss_output
                 [count * weights + index * scales..count * weights + (index + 1) * scales];
-            // Only complete successful reads enter the immutable cache.
-            let inserted = self.cache.insert(id, w, s);
-            admitted += usize::from(inserted.added);
+            // Only complete successful reads enter the immutable cache, protected
+            // until the step that needs them uses them.
+            let inserted = self.cache.insert_ahead(id, w, s);
+            admitted += usize::from(inserted.admitted);
             self.disk
                 .counters
                 .resident_rows
@@ -1854,6 +2025,309 @@ mod tests {
         assert!(reader.gather(&planes, &[100], &mut [0; 264]).is_err());
         std::fs::remove_file(&path).unwrap();
     }
+    #[test]
+    fn a_warm_prefill_sized_gather_copies_every_hit_to_every_requesting_row() {
+        // Enough distinct cached rows that a repeated gather takes the
+        // multi-threaded hit copy, with duplicates, negative ids and planes whose
+        // widths and offsets break any alignment the copy might assume.
+        let path = std::env::temp_dir().join(format!("helios-engram-wide-{}.bin", std::process::id()));
+        let rows = 20_000;
+        let first = 4093;
+        let second = first + rows * 40 + 5;
+        let bytes: Vec<_> = (0..second + rows * 3).map(|i| (i * 31 + i / 509) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let planes = [
+            Plane { file: 0, offset: first as u64, nbytes: rows * 40, row_bytes: 40 },
+            Plane { file: 0, offset: second as u64, nbytes: rows * 3, row_bytes: 3 },
+        ];
+        let ids: Vec<i64> = (0..16_384)
+            .map(|i| if i % 23 == 0 { -1 } else { (i * 7919 % 12_000) as i64 })
+            .collect();
+        let mut expected = Vec::new();
+        for plane in &planes {
+            for &id in &ids {
+                if id < 0 {
+                    expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                } else {
+                    let offset = plane.offset as usize + id as usize * plane.row_bytes;
+                    expected.extend_from_slice(&bytes[offset..offset + plane.row_bytes]);
+                }
+            }
+        }
+        let counters = Arc::<TableCounters>::default();
+        let mut reader =
+            Reader::open(&path, &planes, false, 32 << 20, ids.len(), Arc::default(), counters.clone())
+                .unwrap();
+        let mut warm = 0;
+        for _ in 0..3 {
+            let before = counters.hits.load(Ordering::Relaxed);
+            let mut actual = vec![0xA5; expected.len()];
+            reader.gather(&planes, &ids, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+            warm = counters.hits.load(Ordering::Relaxed) - before;
+        }
+        assert!(
+            warm >= PARALLEL_COPY_ROWS as u64,
+            "a warm gather served {warm} hits, below the parallel copy threshold"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn parallel_gathers_preserve_rows_and_recover_after_truncation() {
+        for (width, scale, rows) in [(80, 10, 65536), (256, 8, 65536), (4109, 37, 2048)] {
+            let path = std::env::temp_dir().join(format!(
+                "flare-worker-rows-{}-{width}.bin",
+                std::process::id()
+            ));
+            let first = 4093;
+            let second = first + rows * width + 7;
+            let bytes: Vec<_> = (0..second + rows * scale)
+                .map(|i| (i * 13 + i / 257) as u8)
+                .collect();
+            std::fs::write(&path, &bytes).unwrap();
+            let planes = [
+                Plane {
+                    file: 0,
+                    offset: first as u64,
+                    nbytes: rows * width,
+                    row_bytes: width,
+                },
+                Plane {
+                    file: 0,
+                    offset: second as u64,
+                    nbytes: rows * scale,
+                    row_bytes: scale,
+                },
+            ];
+            let ids: Vec<i64> = (0..1025)
+                .map(|i| {
+                    if i % 17 == 0 {
+                        -1
+                    } else if i % 19 == 0 {
+                        113
+                    } else {
+                        ((i * 113) % rows) as i64
+                    }
+                })
+                .collect();
+            let mut baseline_reads = None;
+            for workers in [1, 2, 4, 8] {
+                let stats = Arc::new(TableCounters::default());
+                let file = Arc::new(File::open(&path).unwrap());
+                let mut reader = Reader::from_files(
+                    std::slice::from_ref(&file),
+                    &planes,
+                    false,
+                    0,
+                    ids.len(),
+                    Arc::default(),
+                    stats.clone(),
+                    workers,
+                    false,
+                )
+                .unwrap();
+                drop(file);
+                let check = |reader: &mut Reader, ids: &[i64]| {
+                    let mut expected = Vec::new();
+                    for plane in planes {
+                        for &id in ids {
+                            if id < 0 {
+                                expected.extend(std::iter::repeat_n(0, plane.row_bytes));
+                            } else {
+                                let begin = plane.offset as usize + id as usize * plane.row_bytes;
+                                expected.extend_from_slice(&bytes[begin..begin + plane.row_bytes]);
+                            }
+                        }
+                    }
+                    let mut guarded = vec![0xa5; expected.len() + 64];
+                    reader
+                        .gather(&planes, ids, &mut guarded[32..32 + expected.len()])
+                        .unwrap();
+                    assert_eq!(&guarded[32..32 + expected.len()], expected);
+                    assert!(
+                        guarded[..32]
+                            .iter()
+                            .chain(&guarded[32 + expected.len()..])
+                            .all(|b| *b == 0xa5)
+                    );
+                };
+                for count in [0, 1, 77, 1025, 5, 1025] {
+                    check(&mut reader, &ids[..count]);
+                }
+                let count = stats.disk_reads.load(Ordering::Relaxed);
+                if let Some(expected) = baseline_reads {
+                    assert_eq!(count, expected);
+                } else {
+                    baseline_reads = Some(count);
+                }
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                let mut output = vec![0; ids.len() * (width + scale)];
+                assert!(reader.gather(&planes, &ids, &mut output).is_err());
+                std::fs::write(&path, &bytes).unwrap();
+                check(&mut reader, &ids);
+                check(&mut reader, &[rows as i64 - 1, -1, 0, rows as i64 - 1]);
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn parallel_shard_gathers_keep_file_indices_and_recover_after_truncation() {
+        // A whole ring's depth, so every worker count splits its reads.
+        #[cfg(windows)]
+        let ring = DEPTH;
+        #[cfg(unix)]
+        let ring = QUEUE_DEPTH_DEFAULT;
+        let rows = 2048;
+        let width = 4109;
+        let offset = 4093;
+        let planes = std::array::from_fn(|file| Plane {
+            file,
+            offset: offset as u64,
+            nbytes: rows * width,
+            row_bytes: width,
+        });
+        let paths: Vec<_> = (0..2)
+            .map(|file| {
+                std::env::temp_dir().join(format!(
+                    "flare-ring-shard-{}-{file}.bin",
+                    std::process::id()
+                ))
+            })
+            .collect();
+        let bytes: Vec<Vec<u8>> = (0..2)
+            .map(|file| {
+                (0..offset + rows * width)
+                    .map(|i| ((i * 19 + i / 37 + file * 83) % 251) as u8)
+                    .collect()
+            })
+            .collect();
+        for (path, bytes) in paths.iter().zip(&bytes) {
+            std::fs::write(path, bytes).unwrap();
+        }
+        let ids: Vec<i64> = (0..257)
+            .map(|i| match i % 31 {
+                0 => -1,
+                1 => 42,
+                _ => ((i * 7) % rows) as i64,
+            })
+            .collect();
+        let mut baseline_reads = None;
+        for workers in [1, 2, 4, 8] {
+            let files: Vec<_> = paths
+                .iter()
+                .map(|path| Arc::new(open_file(path).unwrap()))
+                .collect();
+            let stats = Arc::new(TableCounters::default());
+            let mut reader = Reader::from_files(
+                &files,
+                &planes,
+                false,
+                0,
+                ids.len(),
+                Arc::default(),
+                stats.clone(),
+                workers,
+                false,
+            )
+            .unwrap();
+            drop(files);
+            let check = |reader: &mut Reader, ids: &[i64]| {
+                let mut expected = Vec::new();
+                for plane in planes {
+                    for &id in ids {
+                        if id < 0 {
+                            expected.extend(std::iter::repeat_n(0, width));
+                        } else {
+                            let start = offset + id as usize * width;
+                            expected.extend_from_slice(&bytes[plane.file][start..start + width]);
+                        }
+                    }
+                }
+                let mut guarded = vec![0xa5; expected.len() + 64];
+                reader
+                    .gather(&planes, ids, &mut guarded[32..32 + expected.len()])
+                    .unwrap();
+                assert_eq!(&guarded[32..32 + expected.len()], expected);
+                assert!(
+                    guarded[..32]
+                        .iter()
+                        .chain(&guarded[32 + expected.len()..])
+                        .all(|b| *b == 0xa5)
+                );
+            };
+            for count in [0, 3, 257, 17, 257] {
+                check(&mut reader, &ids[..count]);
+            }
+            let count = stats.disk_reads.load(Ordering::Relaxed);
+            assert!(count > 2 * ring as u64);
+            if let Some(expected) = baseline_reads {
+                assert_eq!(count, expected);
+            } else {
+                baseline_reads = Some(count);
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&paths[1])
+                .unwrap()
+                .set_len(0)
+                .unwrap();
+            assert!(
+                reader
+                    .gather(&planes, &ids, &mut vec![0; ids.len() * width * 2])
+                    .is_err()
+            );
+            std::fs::write(&paths[1], &bytes[1]).unwrap();
+            check(&mut reader, &ids);
+            check(&mut reader, &[rows as i64 - 1, -1, 0]);
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_workers_share_the_same_queue_and_staging_budget() {
+        let path =
+            std::env::temp_dir().join(format!("flare-lane-budget-{}.bin", std::process::id()));
+        std::fs::write(&path, [0; 4096]).unwrap();
+        let file = Arc::new(File::open(&path).unwrap());
+        for workers in [1, 2, 4, 8] {
+            let counters = Arc::new(TableCounters::default());
+            let reader =
+                DiskReader::from_files(std::slice::from_ref(&file), counters.clone(), workers)
+                    .unwrap();
+            assert_eq!(reader.lanes.len(), workers);
+            // More submitters, never more reads in flight or more pinned staging.
+            let depth: usize = reader.lanes.iter().map(|lane| lane.depth).sum();
+            assert!(depth <= QUEUE_DEPTH_DEFAULT);
+            assert_eq!(counters.disk_queue_depth.load(Ordering::Relaxed), depth as u64);
+            assert_eq!(
+                counters.disk_staging_bytes.load(Ordering::Relaxed),
+                (depth * CHUNK) as u64
+            );
+        }
+        for workers in [0, 3, 16] {
+            assert!(
+                DiskReader::from_files(
+                    std::slice::from_ref(&file),
+                    Arc::new(TableCounters::default()),
+                    workers
+                )
+                .is_err()
+            );
+        }
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn equal_offsets_in_separate_files_never_coalesce() {
         let root = std::env::temp_dir().join(format!("helios-engram-files-{}", std::process::id()));

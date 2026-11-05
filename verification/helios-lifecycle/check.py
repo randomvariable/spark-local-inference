@@ -24,9 +24,14 @@ CHECKS = [("Lifecycle", TEST, "LIFECYCLE_EDGE ", 14),
 MODELS = [check[0] for check in CHECKS] + ["RankDispatch", "EngramDelivery"]
 
 
-def run(command, *, cwd=ROOT):
+# Exhaustive model checks are the long pole: EngramDelivery's liveness check
+# explores 7.7 million states and builds its behaviour graph.
+MODEL_TIMEOUT = 1800
+
+
+def run(command, *, cwd=ROOT, timeout=300):
     result = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, timeout=300)
+                            stderr=subprocess.STDOUT, timeout=timeout)
     for line in result.stdout.splitlines():
         if not any(line.startswith(check[2]) for check in CHECKS):
             print(line, flush=True)
@@ -70,14 +75,14 @@ def check_observations(output, directory, java, jar, module, prefix, width):
             + "\n"
             "SPECIFICATION ObservedSpec\nINVARIANT Corresponds\n"
         )
-        run(tlc(java, jar, directory, "Observed"), cwd=directory)
+        run(tlc(java, jar, directory, "Observed"), cwd=directory, timeout=MODEL_TIMEOUT)
     print(f"Checked {len(edges)} distinct Rust transitions against {module}.tla", flush=True)
 
 
 def tlc(java, jar, directory, module, config=None):
     config = config or f"{module}.cfg"
     return [java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", str(jar), "tlc2.TLC",
-            "-workers", "1", "-metadir", str(directory / f"states-{Path(config).stem}"),
+            "-workers", "auto", "-metadir", str(directory / f"states-{Path(config).stem}"),
             "-config", config, f"{module}.tla"]
 
 
@@ -109,7 +114,7 @@ def check_model_mutation(directory, java, jar, module, needle, replacement, inva
         raise RuntimeError(f"update the {invariant} mutation for {module}")
     source.write_text(original.replace(needle, replacement, 1))
     try:
-        run(tlc(java, jar, directory, module), cwd=directory)
+        run(tlc(java, jar, directory, module), cwd=directory, timeout=MODEL_TIMEOUT)
     except subprocess.CalledProcessError as failure:
         if f"Invariant {invariant} is violated" not in failure.output:
             raise RuntimeError("model mutation failed for an unexpected reason") from failure
@@ -139,9 +144,11 @@ def main():
         shutil.copyfile(MODEL / "Speculation16.cfg", directory / "Speculation16.cfg")
         shutil.copyfile(MODEL / "EngramDeliveryLive.cfg", directory / "EngramDeliveryLive.cfg")
         for module in MODELS:
-            run(tlc(args.java, jar, directory, module), cwd=directory)
-        run(tlc(args.java, jar, directory, "Speculation", "Speculation16.cfg"), cwd=directory)
-        run(tlc(args.java, jar, directory, "EngramDelivery", "EngramDeliveryLive.cfg"), cwd=directory)
+            run(tlc(args.java, jar, directory, module), cwd=directory, timeout=MODEL_TIMEOUT)
+        run(tlc(args.java, jar, directory, "Speculation", "Speculation16.cfg"), cwd=directory,
+            timeout=MODEL_TIMEOUT)
+        run(tlc(args.java, jar, directory, "EngramDelivery", "EngramDeliveryLive.cfg"),
+            cwd=directory, timeout=MODEL_TIMEOUT)
         cargo = ["cargo", "test", "--locked", "--manifest-path", "helios/Cargo.toml", "--lib"]
         if args.target_dir:
             cargo.extend(["--target-dir", str(args.target_dir.resolve())])
@@ -171,15 +178,12 @@ def main():
                 ("Speculation", "Advance(st, ceiling) == Min(ceiling, Geometry(st)[7])",
                  "Advance(st, ceiling) == ceiling", "PendingUsesPhysicalCapacity"),
                 ("EngramDelivery",
-                 "    /\\ Len(before.queue) = 0\n    /\\ before.advisoryPending # 0\n"
-                 "    /\\ after = [before EXCEPT\n          !.worker = Advisory,\n"
-                 "          !.entryBacklog = (Len(before.queue) # 0),",
-                 "    /\\ before.advisoryPending # 0\n"
-                 "    /\\ after = [before EXCEPT\n          !.worker = Advisory,\n"
-                 "          !.entryBacklog = TRUE,",
+                 "    /\\ ~GatherWaiting(before)\n    /\\ before.advisoryPending # 0\n",
+                 "    /\\ before.advisoryPending # 0\n",
                  "NoAdvisoryUnderRealBacklog"),
                 ("EngramDelivery",
-                 "    /\\ before.realClosed\n    /\\ Len(before.queue) = 0\n"
+                 "    /\\ before.realClosed\n    /\\ before.held = NoJob\n"
+                 "    /\\ Len(before.queue) = 0\n"
                  "    /\\ after = [before EXCEPT !.exited = TRUE, !.parked = FALSE]",
                  "    /\\ TRUE\n"
                  "    /\\ after = [before EXCEPT !.exited = TRUE, !.parked = FALSE]",

@@ -561,6 +561,18 @@ impl Requests {
             Self::Device { rows, .. } => *rows,
         }
     }
+    /// Whether `read` can return without waiting: host ids always can, device ids
+    /// once the graph published this sequence, and a cancelled request at once so
+    /// `read` reports the cancellation.
+    fn ready(&self, cancelled: &AtomicBool) -> bool {
+        match self {
+            Self::Host(_) => true,
+            Self::Device { flag, sequence, .. } => {
+                unsafe { &*(*flag as *const AtomicU64) }.load(Ordering::Acquire) == *sequence
+                    || cancelled.load(Ordering::Acquire)
+            }
+        }
+    }
     fn read(self, cancelled: &AtomicBool) -> Result<Vec<i64>> {
         match self {
             Self::Host(ids) => Ok(ids),
@@ -583,18 +595,22 @@ impl Requests {
     }
 }
 const STAGING_FRAMES: usize = 2;
-/// Advisory prefetch batches one reader thread may hold, matching the bound
-/// upstream gives its prefetch queue. A batch beyond it is discarded.
-const PREFETCH_SLOTS: u64 = 64;
+/// Advisory prefetch batches one reader thread may hold. A batch beyond it is
+/// discarded. With `PREFETCH_BATCH_ROWS` it bounds read-ahead to about a million
+/// rows per table, enough to keep a prefill chunk's rows ahead of the graph.
+const PREFETCH_SLOTS: u64 = 256;
+/// Rows in one advisory batch. A gather whose ids are published while a batch is
+/// being read starts when that batch completes, so this bounds the delay warming
+/// can add to a step; it is far below a prefill chunk's row count.
+const PREFETCH_BATCH_ROWS: usize = 4096;
 /// A reader thread parked with advisory batches waiting re-checks its
 /// submission channel at this interval, so a batch handed over between steps is
 /// gathered without waiting for the next step to arrive.
 const PREFETCH_POLL: std::time::Duration = std::time::Duration::from_micros(200);
-/// Recycled row-id buffers kept per table. A step's prediction needs one buffer
-/// for the ids it hands over and one for the expectation it leaves for the reader
-/// thread, and the reader hands both back, so a few are enough to keep the
-/// submission path free of allocation.
-const POOLED_BUFFERS: usize = 4;
+/// Recycled row-id buffers kept per table: one per queued advisory batch, plus the
+/// prediction scratch and expectations of the frames in flight, so read-ahead that
+/// keeps the queue full still allocates nothing in steady state.
+const POOLED_BUFFERS: usize = PREFETCH_SLOTS as usize + 2 * STAGING_FRAMES + 2;
 
 struct Job {
     frame: usize,
@@ -658,13 +674,33 @@ impl State {
 /// thread compares them with what the graph published.
 type Predictions = Arc<Mutex<Vec<(u64, Vec<i64>)>>>;
 
+/// Whether every predicted row is among the rows the graph published.
+///
+/// The prediction covers only host-known positions: the pending token of a
+/// decode lane and the prompt positions of a prefill lane, never graph-produced
+/// drafts. A correct prediction is therefore a subset of what the graph publishes,
+/// and a predicted row the graph did not publish is the disagreement this check
+/// exists to report. `expected` is sorted and deduplicated; `published` is scratch.
+fn predicted_rows_published(expected: &[i64], ids: &[i64], published: &mut Vec<i64>) -> bool {
+    published.clear();
+    published.extend_from_slice(ids);
+    published.sort_unstable();
+    let mut rest = &published[..];
+    expected.iter().all(|id| {
+        let skip = rest.partition_point(|value| value < id);
+        rest = &rest[skip..];
+        rest.first() == Some(id)
+    })
+}
+
 /// What the reader thread does next.
 enum Work {
-    /// A real gather, which always outranks warming.
+    /// A real gather whose ids are readable, which always outranks warming.
     Gather(Job),
     /// One advisory batch, which warms the cache without taking a frame.
     Warm(Vec<i64>),
-    /// Nothing was ready and the poll interval expired.
+    /// Nothing was ready: the poll interval expired, a wake token arrived, or the
+    /// held gather is still waiting for its graph to publish ids.
     Wait,
     /// The submission channel is closed and drained.
     Stop,
@@ -672,21 +708,41 @@ enum Work {
 
 /// Choose the reader thread's next unit of work.
 ///
+/// A submission is taken into `held` as soon as it arrives, but it is gathered
+/// only once its ids are readable. Device ids exist only after the step's graph
+/// starts, which is after the previous step's graph finishes, so a thread that
+/// blocked on them would sit idle through the whole replay that advisory work is
+/// meant to overlap. While the held gather waits, advisory batches run one at a
+/// time, so the gather starts at most one batch after its ids appear.
+///
 /// A closed advisory channel is never a shutdown signal: real gathers may still be
 /// queued, and a thread that exited on it would strand the frame every rank is
-/// waiting on. With nothing ready the thread blocks on the wake token, or polls
-/// briefly while `queued` advisory batches wait, so a batch handed over between
-/// steps is warmed without waiting for the next submission.
+/// waiting on. With nothing held or ready the thread blocks on the wake token, or
+/// polls briefly while `queued` advisory batches wait, so a batch handed over
+/// between steps is warmed without waiting for the next submission.
 fn next_work(
     receiver: &mpsc::Receiver<Job>,
     advisory: &mpsc::Receiver<Vec<i64>>,
     wake: &mpsc::Receiver<()>,
     queued: u64,
+    held: &mut Option<Job>,
+    cancelled: &AtomicBool,
 ) -> Work {
-    match receiver.try_recv() {
-        Ok(job) => return Work::Gather(job),
-        Err(mpsc::TryRecvError::Disconnected) => return Work::Stop,
-        Err(mpsc::TryRecvError::Empty) => {}
+    if held.is_none() {
+        match receiver.try_recv() {
+            Ok(job) => *held = Some(job),
+            Err(mpsc::TryRecvError::Disconnected) => return Work::Stop,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    if let Some(job) = held.as_ref() {
+        if job.requests.ready(cancelled) {
+            return Work::Gather(held.take().unwrap());
+        }
+        return match advisory.try_recv() {
+            Ok(ids) => Work::Warm(ids),
+            Err(_) => Work::Wait,
+        };
     }
     if let Ok(ids) = advisory.try_recv() {
         return Work::Warm(ids);
@@ -702,7 +758,12 @@ fn next_work(
         Work::Wait
     } else {
         match receiver.recv_timeout(PREFETCH_POLL) {
-            Ok(job) => Work::Gather(job),
+            // Re-probe through `held`, so a device gather is still taken only
+            // once its ids are readable.
+            Ok(job) => {
+                *held = Some(job);
+                Work::Wait
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => Work::Wait,
             Err(mpsc::RecvTimeoutError::Disconnected) => Work::Stop,
         }
@@ -893,13 +954,18 @@ impl Shared {
             let worker = thread::Builder::new()
                 .name(format!("flare-{}", table.event))
                 .spawn(move || {
+                    let mut held = None;
+                    // Sorted copy of a step's published ids, reused across steps.
+                    let mut published = Vec::new();
                     loop {
-                        // Real submissions always outrank advisory warming.
+                        // Readable submissions always outrank advisory warming.
                         let job = match next_work(
                             &receiver,
                             &prefetch_receiver,
                             &wake_receiver,
                             queued.prefetch_queue_batches.load(Ordering::Acquire),
+                            &mut held,
+                            &stop,
                         ) {
                             Work::Gather(job) => job,
                             Work::Warm(ids) => {
@@ -933,7 +999,13 @@ impl Shared {
                                 drop(pool);
                                 continue;
                             }
-                            Work::Wait => continue,
+                            Work::Wait => {
+                                // A held gather is waiting for its graph: keep
+                                // observing the flag as closely as the old blocking
+                                // read did, between advisory batches.
+                                std::hint::spin_loop();
+                                continue;
+                            }
                             Work::Stop => break,
                         };
                         // Each frame stays owned until every rank retires its consuming graph.
@@ -945,39 +1017,12 @@ impl Shared {
                                 job.requests.rows() * row_bytes,
                             )
                         };
+                        let mut ids = Vec::new();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if stop.load(Ordering::Acquire) {
                                 return Err("n-gram request cancelled".into());
                             }
-                            let ids = job.requests.read(&stop)?;
-                            // Compare the authoritative ids with what the
-                            // submission predicted for this sequence. A published
-                            // row the prediction missed means the host derivation
-                            // disagrees with the graph, which is the only defect
-                            // this counter is meant to surface.
-                            let mut predicted = observed.lock().unwrap();
-                            if let Some(position) =
-                                predicted.iter().position(|(entry, _)| *entry == job.sequence)
-                            {
-                                let (_, mut expected) = predicted.remove(position);
-                                // The expectation is sorted and deduplicated when recorded. A
-                                // published row this table's prediction missed means the host
-                                // derivation disagrees with the graph; a row predicted but never
-                                // requested only cost bandwidth, so it is not counted here.
-                                if ids.iter().any(|id| {
-                                    *id >= 0 && expected.binary_search(id).is_err()
-                                }) {
-                                    queued
-                                        .prediction_mismatches
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                                expected.clear();
-                                let mut pool = recycled.lock().unwrap();
-                                if pool.len() < POOLED_BUFFERS {
-                                    pool.push(expected);
-                                }
-                            }
-                            drop(predicted);
+                            ids = job.requests.read(&stop)?;
                             reader.gather(&planes, &ids, output)
                         }))
                         .unwrap_or_else(|_| Err("Engram reader panicked".into()));
@@ -988,6 +1033,27 @@ impl Shared {
                         }
                         // Release failed reads too, so graph shutdown can drain before reporting the error.
                         buffers.signal(job.generation);
+                        // Check the prediction only after the frame is released, so
+                        // the comparison never delays the graph.
+                        let expected = {
+                            let mut predicted = observed.lock().unwrap();
+                            predicted
+                                .iter()
+                                .position(|(entry, _)| *entry == job.sequence)
+                                .map(|position| predicted.remove(position).1)
+                        };
+                        if let Some(mut expected) = expected {
+                            if !ids.is_empty()
+                                && !predicted_rows_published(&expected, &ids, &mut published)
+                            {
+                                queued.prediction_mismatches.fetch_add(1, Ordering::Relaxed);
+                            }
+                            expected.clear();
+                            let mut pool = recycled.lock().unwrap();
+                            if pool.len() < POOLED_BUFFERS {
+                                pool.push(expected);
+                            }
+                        }
                     }
                 })
                 .map_err(|e| format!("start Engram reader: {e}"))?;
@@ -1016,14 +1082,6 @@ impl Shared {
         }))
     }
 
-    /// Committed tokens a prediction needs before its first query position.
-    pub(crate) fn history_depth(&self, table: usize) -> usize {
-        self.index
-            .tables
-            .get(table)
-            .map_or(2, |table| history_depth(&table.geometry))
-    }
-
     /// Take a recycled row-id buffer for one table, or a fresh one the first time.
     fn take_buffer(&self, table: usize) -> Vec<i64> {
         self.layers
@@ -1043,85 +1101,108 @@ impl Shared {
         }
     }
 
-    /// Predict the rows the given token window will request and hand them to the
-    /// table's reader thread.
-    ///
-    /// `window` holds the committed tokens preceding the first query followed by
-    /// the `queries` tokens the launching step consumes, at absolute positions
-    /// starting at `base`. `excluded` reports a position that never enters an
-    /// n-gram history, such as an image position. Returns whether any batch was
-    /// accepted.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn predict(
+    /// Whether advisory warming can do anything: it is enabled and the tables are
+    /// read from disk into a nonzero row cache.
+    pub(crate) fn prefetching(&self) -> bool {
+        self.prefetch && self.storage == Storage::Disk && self.stats.cache_bytes() != 0
+    }
+
+    /// Query positions one advisory batch covers for `table`.
+    pub(crate) fn batch_tokens(&self, table: usize) -> usize {
+        self.index
+            .tables
+            .get(table)
+            .map_or(1, |table| (PREFETCH_BATCH_ROWS / table.heads.max(1)).max(1))
+    }
+
+    /// Query positions `table` may hold read ahead of the step being launched: a
+    /// quarter of its row cache, so protected read-ahead rows never crowd out the
+    /// rows in steady use, and no more than its advisory queue holds.
+    pub(crate) fn read_ahead_tokens(&self, table: usize) -> usize {
+        let Some(entry) = self.index.tables.get(table) else {
+            return 0;
+        };
+        let capacity = self
+            .stats
+            .table(table)
+            .map_or(0, |counters| counters.capacity_rows.load(Ordering::Relaxed) as usize);
+        let rows = (capacity / 4).min(PREFETCH_SLOTS as usize * PREFETCH_BATCH_ROWS);
+        rows / entry.heads.max(1)
+    }
+
+    /// Append to `out` the rows the query positions `[first, end)` of `tokens`
+    /// will request from `table`. Committed history before `first` comes from
+    /// `tokens` too. `excluded` reports a position that never enters an n-gram
+    /// history, such as an image position. Rows outside this rank's partition and
+    /// unaddressable windows report nothing.
+    pub(crate) fn predict_rows(
         &self,
         table: usize,
-        sequence: u64,
-        window: &[u32],
-        queries: usize,
-        base: usize,
+        tokens: &[u32],
+        first: usize,
+        end: usize,
         excluded: impl Fn(usize) -> bool,
-        scratch: &mut Vec<i64>,
-    ) -> bool {
-        // Predicting from an empty cache budget would queue work nobody serves.
-        if !self.prefetch || self.storage != Storage::Disk || self.stats.cache_bytes() == 0 {
-            return false;
-        }
+        out: &mut Vec<i64>,
+    ) {
         let Some(entry) = self.index.tables.get(table) else {
-            return false;
+            return;
         };
-        if queries == 0 || window.len() < queries {
-            return false;
+        if first >= end || tokens.len() < end {
+            return;
         }
-        // Compress into a recycled buffer: a prefill chunk's window is as wide as
-        // its token count, so the submission path must not allocate per step.
+        let base = first.saturating_sub(history_depth(&entry.geometry) - 1);
+        // Compress and derive into recycled buffers: a prefill window is as wide
+        // as its token count, so the submission path must not allocate per step.
         let mut compressed = self.take_buffer(table);
         compress_into(
             &self.index,
             entry,
             base,
-            window,
+            &tokens[base..end],
             excluded,
             &mut compressed,
         );
-        let (history, queries) = compressed.split_at(compressed.len() - queries);
-        query_row_ids(&self.index, entry, history, queries, scratch);
+        let (history, queries) = compressed.split_at(compressed.len() - (end - first));
+        let mut ids = self.take_buffer(table);
+        query_row_ids(&self.index, entry, history, queries, &mut ids);
+        out.extend(ids.iter().copied().filter(|&id| id >= 0));
+        self.return_buffer(table, ids);
         self.return_buffer(table, compressed);
-        // Unowned partitions and unaddressable windows report no row.
-        scratch.retain(|&id| id >= 0);
-        if scratch.is_empty() {
-            return false;
-        }
-        let handed = self.prefetch(table, scratch);
-        // Keep the expectation for the reader thread to check against the ids the
-        // graph publishes for this sequence. Duplicates within the window collapse,
-        // so the comparison is a membership test. The reader returns this buffer to
-        // the pool, and the caller keeps a recycled one.
-        if handed {
-            let mut expected = std::mem::replace(scratch, self.take_buffer(table));
-            expected.sort_unstable();
-            expected.dedup();
-            let Some(layer) = self.layers.get(table) else {
-                return handed;
-            };
-            let mut predicted = layer.predicted.lock().unwrap();
-            // Two frames may be in flight and a step can be superseded before the
-            // reader reaches it; keep the most recent few and let older ones age out.
-            predicted.retain(|(entry, _)| *entry != sequence);
-            predicted.push((sequence, expected));
-            if predicted.len() > 2 * STAGING_FRAMES {
-                let (_, stale) = predicted.remove(0);
-                drop(stale);
-            }
-        }
-        handed
     }
 
-    /// Hand predicted row ids to one table's reader thread for cache warming.
+    /// Leave the rows predicted for `sequence` for the reader thread to check
+    /// against the ids the graph publishes for that step. `ids` is taken and
+    /// replaced with a recycled buffer.
+    pub(crate) fn expect(&self, table: usize, sequence: u64, ids: &mut Vec<i64>) {
+        let Some(layer) = self.layers.get(table) else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let mut expected = std::mem::replace(ids, self.take_buffer(table));
+        expected.sort_unstable();
+        expected.dedup();
+        let mut predicted = layer.predicted.lock().unwrap();
+        // Two frames may be in flight and a step can be superseded before the
+        // reader reaches it; keep the most recent few and let older ones age out.
+        predicted.retain(|(entry, _)| *entry != sequence);
+        predicted.push((sequence, expected));
+        if predicted.len() > 2 * STAGING_FRAMES {
+            let (_, stale) = predicted.remove(0);
+            self.return_buffer(table, stale);
+        }
+    }
+
+    /// Hand predicted row ids to one table's reader thread for cache warming, in
+    /// batches of at most `PREFETCH_BATCH_ROWS`.
     ///
     /// Advisory by contract: it never blocks, never reports an error, and is a
     /// no-op unless the table's rows can actually be cached. A batch that finds
-    /// the queue full is discarded, matching the upstream prefetch queue, which
-    /// also drops the newest request rather than delaying a serving thread.
+    /// the queue full is discarded together with every later batch, matching the
+    /// upstream prefetch queue, which also drops the newest request rather than
+    /// delaying a serving thread. Returns whether every row was queued, so a
+    /// caller tracking read-ahead progress can retry the rest later.
     pub(crate) fn prefetch(&self, table: usize, ids: &[i64]) -> bool {
         if !self.prefetch || self.storage != Storage::Disk {
             return false;
@@ -1135,15 +1216,18 @@ impl Shared {
         let Some(sender) = layer.prefetch.as_ref() else {
             return false;
         };
-        let mut accepted = false;
-        for chunk in ids.chunks(layer.max_rows) {
-            let depth = layer.counters.prefetch_queue_batches.load(Ordering::Acquire);
-            if depth >= PREFETCH_SLOTS {
+        let batch_rows = layer.max_rows.min(PREFETCH_BATCH_ROWS);
+        for (index, chunk) in ids.chunks(batch_rows).enumerate() {
+            let refuse = || {
                 layer
                     .counters
                     .prefetch_rows_dropped
-                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                continue;
+                    .fetch_add((ids.len() - index * batch_rows) as u64, Ordering::Relaxed);
+                false
+            };
+            let depth = layer.counters.prefetch_queue_batches.load(Ordering::Acquire);
+            if depth >= PREFETCH_SLOTS {
+                return refuse();
             }
             let mut batch = self.take_buffer(table);
             batch.extend_from_slice(chunk);
@@ -1156,11 +1240,7 @@ impl Shared {
                     }
                 };
                 self.return_buffer(table, batch);
-                layer
-                    .counters
-                    .prefetch_rows_dropped
-                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
-                continue;
+                return refuse();
             }
             layer
                 .counters
@@ -1173,9 +1253,8 @@ impl Shared {
             // Post after enqueueing, so a thread that parks between the probes
             // still finds the token waiting. A pending token makes this free.
             let _ = layer.wake.try_send(());
-            accepted = true;
         }
-        accepted
+        true
     }
 
     #[cfg(any(feature = "server", test))]
@@ -1539,82 +1618,167 @@ mod tests {
         }
     }
 
+    /// The reader loop's channels and held job, driven one decision at a time.
+    struct Loop {
+        receiver: mpsc::Receiver<Job>,
+        advisory: mpsc::Receiver<Vec<i64>>,
+        wake: mpsc::Receiver<()>,
+        held: Option<Job>,
+        cancelled: AtomicBool,
+    }
+
+    impl Loop {
+        fn new() -> (mpsc::Sender<Job>, mpsc::Sender<Vec<i64>>, mpsc::Sender<()>, Self) {
+            let (sender, receiver) = mpsc::channel();
+            let (advisory_sender, advisory) = mpsc::channel();
+            let (wake_sender, wake) = mpsc::channel();
+            let state = Self {
+                receiver,
+                advisory,
+                wake,
+                held: None,
+                cancelled: AtomicBool::new(false),
+            };
+            (sender, advisory_sender, wake_sender, state)
+        }
+
+        fn next(&mut self, queued: u64) -> Work {
+            next_work(
+                &self.receiver,
+                &self.advisory,
+                &self.wake,
+                queued,
+                &mut self.held,
+                &self.cancelled,
+            )
+        }
+
+        /// Re-probe through `Wait` as the reader thread does.
+        fn settle(&mut self, queued: u64) -> Work {
+            loop {
+                match self.next(queued) {
+                    Work::Wait => continue,
+                    work => return work,
+                }
+            }
+        }
+    }
+
     #[test]
-    fn reader_thread_prefers_a_real_gather_over_advisory_warming() {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        let (_wake_sender, wake_receiver) = mpsc::channel::<()>();
+    fn reader_thread_prefers_a_readable_gather_over_advisory_warming() {
+        let (sender, advisory, _wake, mut state) = Loop::new();
         // Advisory work is queued first, so a priority inversion would show up here.
-        advisory_sender.send(vec![7, 12]).unwrap();
+        advisory.send(vec![7, 12]).unwrap();
         sender.send(job(1)).unwrap();
         assert!(
-            matches!(
-                next_work(&receiver, &advisory_receiver, &wake_receiver, 1),
-                Work::Gather(_)
-            ),
-            "a submission must outrank a queued batch"
+            matches!(state.next(1), Work::Gather(_)),
+            "a readable submission must outrank a queued batch"
         );
-        assert!(matches!(
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 1),
-            Work::Warm(_)
-        ));
+        assert!(matches!(state.next(1), Work::Warm(_)));
         // Only a closed and drained submission channel ends the thread.
         drop(sender);
-        assert!(matches!(
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
-            Work::Stop
-        ));
+        assert!(matches!(state.next(0), Work::Stop));
+    }
+
+    #[test]
+    fn an_unpublished_device_gather_yields_to_warming_until_its_ids_appear() {
+        let ids = [17i64, 31, 47];
+        let flag = AtomicU64::new(0);
+        let (sender, advisory, _wake, mut state) = Loop::new();
+        sender
+            .send(Job {
+                frame: 1,
+                generation: 1,
+                sequence: 5,
+                requests: Requests::Device {
+                    address: ids.as_ptr() as usize,
+                    flag: &flag as *const AtomicU64 as usize,
+                    sequence: 5,
+                    rows: ids.len(),
+                },
+            })
+            .unwrap();
+        advisory.send(vec![1]).unwrap();
+        advisory.send(vec![2]).unwrap();
+        // The step's graph has not started, so its rows cannot be read yet. The
+        // thread holds the job and spends the wait on read-ahead, which is the
+        // replay window advisory work exists to use.
+        assert!(matches!(state.next(2), Work::Warm(batch) if batch == [1]));
+        assert!(matches!(state.next(1), Work::Warm(batch) if batch == [2]));
+        assert!(state.held.is_some(), "the submission must stay held");
+        assert!(matches!(state.next(0), Work::Wait));
+        advisory.send(vec![3]).unwrap();
+        flag.store(5, Ordering::Release);
+        // Publication makes the held gather outrank the batch behind it.
+        assert!(matches!(state.next(1), Work::Gather(job) if job.sequence == 5));
+        assert!(matches!(state.next(1), Work::Warm(batch) if batch == [3]));
+        drop(sender);
+        assert!(matches!(state.next(0), Work::Stop));
+    }
+
+    #[test]
+    fn a_cancelled_unpublished_gather_is_released_to_report_cancellation() {
+        let flag = AtomicU64::new(0);
+        let (sender, _advisory, _wake, mut state) = Loop::new();
+        sender
+            .send(Job {
+                frame: 0,
+                generation: 1,
+                sequence: 4,
+                requests: Requests::Device {
+                    address: 0,
+                    flag: &flag as *const AtomicU64 as usize,
+                    sequence: 4,
+                    rows: 0,
+                },
+            })
+            .unwrap();
+        assert!(matches!(state.next(0), Work::Wait));
+        // A closed submission channel does not end the thread while a gather is
+        // held: the frame every rank waits on still has to be released.
+        drop(sender);
+        assert!(matches!(state.next(0), Work::Wait));
+        // A graph that will never publish must not pin the thread: cancellation
+        // hands the job to the gather path, whose read reports the cancellation
+        // and still releases the frame.
+        state.cancelled.store(true, Ordering::Release);
+        assert!(matches!(state.next(0), Work::Gather(job) if job.sequence == 4));
+        assert!(matches!(state.next(0), Work::Stop));
     }
 
     #[test]
     fn a_closed_advisory_channel_is_never_a_shutdown_signal() {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        let (_wake_sender, wake_receiver) = mpsc::channel::<()>();
+        let (sender, advisory, _wake, mut state) = Loop::new();
         sender.send(job(3)).unwrap();
         // Dropping the advisory sender with real work still queued must not end the
         // thread: a graph would wait forever on the frame that work publishes.
-        drop(advisory_sender);
-        assert!(matches!(
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
-            Work::Gather(_)
-        ));
+        drop(advisory);
+        assert!(matches!(state.next(0), Work::Gather(_)));
         drop(sender);
-        assert!(matches!(
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
-            Work::Stop
-        ));
+        assert!(matches!(state.next(0), Work::Stop));
     }
 
     #[test]
     fn a_parked_reader_wakes_for_a_submission() {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let (_, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
+        let (sender, _advisory, wake, mut state) = Loop::new();
         // A Receiver is not shareable, so the parked thread owns every channel.
-        let parked = thread::spawn(move || {
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0)
-        });
+        let parked = thread::spawn(move || state.settle(0));
         // `Shared::start` enqueues the job and then posts the token, which is what
         // releases a thread blocked between steps.
         sender.send(job(9)).unwrap();
-        wake_sender.send(()).unwrap();
+        wake.send(()).unwrap();
         assert!(matches!(parked.join().unwrap(), Work::Gather(job) if job.sequence == 9));
     }
 
     #[test]
     fn a_parked_reader_wakes_for_an_advisory_batch() {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
-        let parked = thread::spawn(move || {
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0)
-        });
+        let (sender, advisory, wake, mut state) = Loop::new();
+        let parked = thread::spawn(move || state.settle(0));
         // `Shared::prefetch` touches only the advisory channel and the token. A
         // thread parked on the submission channel alone never sees it, and then the
         // step the batch was meant to warm still waits on the disk.
-        advisory_sender.send(vec![4, 5]).unwrap();
-        wake_sender.send(()).unwrap();
+        advisory.send(vec![4, 5]).unwrap();
+        wake.send(()).unwrap();
         assert!(
             matches!(parked.join().unwrap(), Work::Warm(ids) if ids == vec![4, 5]),
             "an idle reader must warm the rows predicted for the next step"
@@ -1624,17 +1788,25 @@ mod tests {
 
     #[test]
     fn a_stray_wake_token_reprobes_instead_of_stopping() {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let (_, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
+        let (sender, _advisory, wake, mut state) = Loop::new();
         // Coalescing means a token can be posted with nothing behind it, or already
         // consumed by a competing wake. Either way the thread re-probes and stays.
-        wake_sender.send(()).unwrap();
-        assert!(matches!(
-            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
-            Work::Wait
-        ));
+        wake.send(()).unwrap();
+        assert!(matches!(state.next(0), Work::Wait));
         drop(sender);
+    }
+
+    #[test]
+    fn predicted_rows_must_all_be_published() {
+        let mut scratch = Vec::new();
+        // Graph-produced draft rows (90, 91) were never predicted, and a row may be
+        // published by several positions: neither is a disagreement.
+        assert!(predicted_rows_published(&[3, 8, 12], &[12, 90, 3, 8, 91, 3], &mut scratch));
+        assert!(predicted_rows_published(&[], &[5], &mut scratch));
+        // A predicted row the graph did not request means the host derivation
+        // computed a different id for a position it claimed to know.
+        assert!(!predicted_rows_published(&[3, 9], &[3, 8, 12], &mut scratch));
+        assert!(!predicted_rows_published(&[13], &[3, 8, 12], &mut scratch));
     }
 
     #[cfg(feature = "server")]

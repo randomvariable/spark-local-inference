@@ -8,11 +8,27 @@
 use crate::Result;
 
 const WAYS: usize = 4;
+/// Marks a row read ahead of its first use. A pinned row was admitted without
+/// the frequency test, because a row predicted for the next step is about to be
+/// used however rarely it was seen before, and no insertion may evict it until
+/// it is used or its pin goes stale. The bit lives in the recency stamp, which
+/// can never reach it, so an entry stays two words.
+const PINNED: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct Entry {
     id: i64,
     accessed: u64,
+}
+
+impl Entry {
+    fn stamp(self) -> u64 {
+        self.accessed & !PINNED
+    }
+
+    fn pinned(self) -> bool {
+        self.accessed & PINNED != 0
+    }
 }
 
 pub(super) struct RowCache {
@@ -61,8 +77,20 @@ impl Frequency {
 }
 
 pub(super) struct Insertion {
+    /// The row is resident after the call.
+    pub admitted: bool,
+    /// It took a previously empty slot.
     pub added: bool,
+    /// It displaced a different row.
     pub evicted: bool,
+}
+
+impl Insertion {
+    const REFUSED: Self = Self {
+        admitted: false,
+        added: false,
+        evicted: false,
+    };
 }
 
 impl RowCache {
@@ -137,6 +165,8 @@ impl RowCache {
         first..first + WAYS
     }
 
+    /// Serve a row and count the use. A read-ahead row stops being protected
+    /// once it is used and competes on frequency and recency from then on.
     pub fn get(&mut self, id: i64) -> Option<&[u8]> {
         self.frequency.observe(id);
         let slot = self.set(id).find(|&slot| self.entries[slot].id == id)?;
@@ -145,46 +175,89 @@ impl RowCache {
         Some(&self.payload[slot * self.row_bytes..(slot + 1) * self.row_bytes])
     }
 
+    /// Whether `id` is resident, pinning it for an upcoming use if so. A
+    /// prediction is not a use: the frequency estimate is left to the gather
+    /// that consumes the row, so warming never counts a row twice.
+    pub fn pin(&mut self, id: i64) -> bool {
+        let Some(slot) = self.set(id).find(|&slot| self.entries[slot].id == id) else {
+            return false;
+        };
+        self.clock = self.clock.saturating_add(1);
+        self.entries[slot].accessed = self.clock | PINNED;
+        true
+    }
+
     pub fn insert(&mut self, id: i64, weights: &[u8], scales: &[u8]) -> Insertion {
         debug_assert!(id >= 0);
         debug_assert_eq!(weights.len() + scales.len(), self.row_bytes);
         self.clock = self.clock.saturating_add(1);
-        let Some(slot) = self.admit(id, self.clock) else {
-            return Insertion {
-                added: false,
-                evicted: false,
-            };
-        };
+        match self.admit(id, self.clock) {
+            Some(slot) => self.place(slot, id, self.clock, weights, scales),
+            None => Insertion::REFUSED,
+        }
+    }
+
+    /// Insert a row read ahead of its first use. It is admitted regardless of
+    /// how often it was seen, and refused only when every way of its set already
+    /// holds a protected read-ahead row.
+    pub fn insert_ahead(&mut self, id: i64, weights: &[u8], scales: &[u8]) -> Insertion {
+        debug_assert!(id >= 0);
+        debug_assert_eq!(weights.len() + scales.len(), self.row_bytes);
+        self.clock = self.clock.saturating_add(1);
+        match self.victim(id) {
+            Some(slot) => self.place(slot, id, self.clock | PINNED, weights, scales),
+            None => Insertion::REFUSED,
+        }
+    }
+
+    fn place(
+        &mut self,
+        slot: usize,
+        id: i64,
+        accessed: u64,
+        weights: &[u8],
+        scales: &[u8],
+    ) -> Insertion {
         let previous = self.entries[slot].id;
-        self.entries[slot] = Entry {
-            id,
-            accessed: self.clock,
-        };
+        self.entries[slot] = Entry { id, accessed };
         self.fill(id, weights, scales);
         Insertion {
+            admitted: true,
             added: previous == -1,
             evicted: previous >= 0 && previous != id,
         }
     }
 
-    fn admit(&self, id: i64, accessed: u64) -> Option<usize> {
+    /// A read-ahead row stays protected for one turnover of the cache's
+    /// operations. A row predicted but never requested, such as one for a
+    /// cancelled request, then ages back into an ordinary entry.
+    fn protected(&self, entry: Entry) -> bool {
+        entry.pinned() && self.clock.saturating_sub(entry.stamp()) < self.entries.len() as u64
+    }
+
+    /// The slot `id` would occupy: its own, an empty way, or the way with the
+    /// lowest usage and then the oldest use among those not protected.
+    fn victim(&self, id: i64) -> Option<usize> {
         let set = self.set(id);
-        let slot = set
-            .clone()
+        set.clone()
             .find(|&slot| self.entries[slot].id == id)
             .or_else(|| set.clone().find(|&slot| self.entries[slot].id == -1))
-            .unwrap_or_else(|| {
-                set.min_by_key(|&slot| {
-                    let entry = self.entries[slot];
-                    (self.frequency.estimate(entry.id), entry.accessed)
-                })
-                .unwrap()
-            });
+            .or_else(|| {
+                set.filter(|&slot| !self.protected(self.entries[slot]))
+                    .min_by_key(|&slot| {
+                        let entry = self.entries[slot];
+                        (self.frequency.estimate(entry.id), entry.stamp())
+                    })
+            })
+    }
+
+    fn admit(&self, id: i64, accessed: u64) -> Option<usize> {
+        let slot = self.victim(id)?;
         let previous = self.entries[slot];
         (previous.id < 0
             || previous.id == id
             || (self.frequency.estimate(id), accessed)
-                >= (self.frequency.estimate(previous.id), previous.accessed))
+                >= (self.frequency.estimate(previous.id), previous.stamp()))
             .then_some(slot)
     }
 
@@ -265,6 +338,62 @@ mod tests {
             cache.insert(12, &payload, &[]);
         }
         assert!(cache.get(12).is_some());
+    }
+
+    #[test]
+    fn read_ahead_rows_pass_frequent_rows_and_stay_until_used() {
+        // One four-way set whose residents are all in steady use, as after a long
+        // conversation: an ordinary miss for a never-seen row is refused.
+        let mut cache = RowCache::new(16384, 1000, 2048).unwrap();
+        let payload = [0; 2048];
+        assert_eq!(cache.capacity(), 4);
+        for id in 0..4 {
+            cache.insert(id, &payload, &[]);
+            for _ in 0..20 {
+                cache.get(id);
+            }
+        }
+        assert!(!cache.insert(10, &payload, &[]).admitted);
+        // A row predicted for the next step is admitted anyway, and the next
+        // read-ahead row must not displace it before that step uses it.
+        let first = cache.insert_ahead(10, &payload, &[]);
+        assert!(first.admitted && first.evicted);
+        assert!(cache.insert_ahead(11, &payload, &[]).evicted);
+        assert!(cache.pin(10), "the first read-ahead row was evicted before use");
+        // Once used it is an ordinary, rarely used row, so it is the next victim
+        // rather than the rows the conversation keeps using.
+        assert!(cache.get(10).is_some());
+        assert!(cache.get(11).is_some());
+        assert!(cache.insert_ahead(12, &payload, &[]).evicted);
+        assert!(cache.get(10).is_none() || cache.get(11).is_none());
+        assert_eq!((0..4).filter(|&id| cache.pin(id)).count(), 2);
+    }
+
+    #[test]
+    fn a_set_of_fresh_read_ahead_rows_refuses_more_until_the_pins_go_stale() {
+        // Two sets, so the protection horizon (one turnover, eight operations)
+        // outlasts one set's four read-ahead insertions.
+        let mut cache = RowCache::new(17200, 1000, 2048).unwrap();
+        let payload = [0; 2048];
+        assert_eq!(cache.capacity(), 8);
+        let first = cache.set(0).start;
+        let (same, other): (Vec<i64>, Vec<i64>) =
+            (0..64).partition(|&id| cache.set(id).start == first);
+        for &id in &same[..4] {
+            assert!(cache.insert_ahead(id, &payload, &[]).admitted);
+        }
+        // Every way holds a row a coming step needs: neither read-ahead nor an
+        // ordinary miss may take one.
+        assert!(!cache.insert_ahead(same[4], &payload, &[]).admitted);
+        assert!(!cache.insert(same[4], &payload, &[]).admitted);
+        // Rows predicted but never requested, as for a cancelled request, stop
+        // being protected after a full turnover of the cache's operations.
+        for &id in &other[..4] {
+            cache.insert(id, &payload, &[]);
+        }
+        let late = cache.insert_ahead(same[4], &payload, &[]);
+        assert!(late.admitted && late.evicted);
+        assert!(!cache.pin(same[0]), "the oldest stale pin is the victim");
     }
 
     #[test]

@@ -660,7 +660,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
-| `--embedding-table-prefetch` / `--no-embedding-table-prefetch` | Predict the rows the launching step will request and warm them through the reader thread while the previous step replays | Enabled for disk tables with a row cache |
+| `--embedding-table-prefetch` / `--no-embedding-table-prefetch` | Predict the rows coming steps will request and read them into the row cache while earlier steps replay, reading prompts ahead of prefill | Enabled for disk tables with a row cache |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
 probability `p` as `sqrt(p)` when choosing complete speculative programs
@@ -669,10 +669,14 @@ favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses existing package graphs and does not enable
 adaptive verification when fixed-width selection is configured.
 
-`--embedding-table-workers 1|2|4|8` controls Windows disk-reader workers.
-Workers share 128 I/O slots and 8 MiB of direct-read staging per embedding table.
-Windows defaults to four workers; other platforms retain one. Explicit worker
-counts override the default. Large gathers use scoped helper threads, whose startup
+`--embedding-table-workers 1|2|4|8` sets the disk-reader workers per embedding
+table, each submitting through its own I/O ring. Workers share one queue and
+staging budget per table: 128 I/O slots and 8 MiB of direct-read staging on
+Windows, and on Linux the io_uring depth that landed (256 slots and 16 MiB unless
+the locked-memory limit lowered it). More workers add submitters without adding
+reads in flight, which matters for drives that only reach their random-read rate
+with many submitting threads. Windows defaults to four workers; Linux retains one.
+Explicit worker counts override the default. Large gathers use scoped helper threads, whose startup
 cost is included in gather latency. Small gathers stay on the delivery thread.
 Worker phase counters sum overlapping worker intervals and must not be subtracted
 from elapsed gather time. RAM storage rejects this disk-only option.
@@ -703,34 +707,49 @@ RAM table storage already retains both planes. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
 
-`--embedding-table-prefetch` asks each table's reader thread to fetch the rows the
-step about to be launched will request, from the host-side token window, while the
-previous step still replays. The prediction uses only the addressing the package
-declares (`EngramHash.method`, `orders`, `multipliers`, `primes`, `offsets`, and the
-`Engram` `token_map`, `pad_token_id` and `compressed_vocabulary`), so no recipe or
-model identity reaches the runtime. It is advisory: the captured graph remains the
-authority, it publishes the ids its own lookup consumes, and the real gather reads
-them whether or not the prediction was right. Prefetch never allocates GPU memory,
-never enters a graph, and never takes a staging frame; it fills the same bounded
-host row cache that a request gather warms. A batch that finds the reader's bounded
-advisory queue full is discarded, and every reader thread serves a real submission
-before any advisory batch, so prefetch cannot delay a step. The option is refused
-for `--embedding-table-storage ram`, and no prefetching happens when the row cache
-is disabled. Only the prompt positions of a prefill lane and the pending token of a
-decode, speculative, or mixed lane are predictable from host state: drafts beyond
-that pending token are produced inside the graph, so those rows are requested the
-ordinary way.
+`--embedding-table-prefetch` asks each table's reader thread to read rows into the
+row cache before the graph that requests them runs. A graph publishes its row ids
+only once it starts, so without prefetch every row miss is read while the GPU
+waits, and a cold prompt alternates between disk and GPU work instead of
+overlapping them. A prefill lane's prompt is known at admission, so its rows are
+read ahead of the launching chunk, continuing from where the previous step left
+off, up to a quarter of the table's row cache or the advisory queue's bound of
+about a million rows. Prompts prefilled together share that bound. A decode,
+speculative, or mixed lane hands over its pending token only when no step is in
+flight: a pipelined step takes its input from the previous step's device output,
+which the host has not seen yet. While a submitted step's graph has not yet published its ids, its reader
+thread spends that wait reading ahead in batches of 4096 rows, so a step whose ids
+appear waits at most for the batch in progress. A row read ahead is admitted to
+the cache however rarely it was requested before, and it is protected from
+eviction until a gather uses it or one full turnover of cache operations passes.
+
+The prediction uses only the addressing the package declares (`EngramHash.method`,
+`orders`, `multipliers`, `primes`, `offsets`, and the `Engram` `token_map`,
+`pad_token_id` and `compressed_vocabulary`), so no recipe or model identity reaches
+the runtime. It is advisory: the captured graph remains the authority, it publishes
+the ids its own lookup consumes, and the real gather reads them whether or not the
+prediction was right. Prefetch never allocates GPU memory, never enters a graph,
+and never takes a staging frame; it fills the same bounded host row cache that a
+request gather warms. Batches that find the reader's advisory queue full are
+discarded and offered again with the next step. The option is refused for
+`--embedding-table-storage ram`, and no prefetching happens when the row cache is
+disabled. Read-ahead depth follows the cache size: a cache smaller than one prefill
+chunk's rows can only warm part of each chunk. Drafts beyond a decode lane's pending
+token are produced inside the graph, so those rows are requested the ordinary way.
 
 `flare_engram_prefetch_submissions_total` and
 `flare_engram_prefetch_dropped_submissions_total` count the steps whose predicted
-rows were handed over and the steps whose batches found the queue full;
+rows were all queued and the steps for which the queue refused some;
 `flare_engram_prefetch_enabled` separates a disabled prefetcher from one that is
 keeping up. Per table, `flare_engram_table_prefetch_rows_total`,
 `..._rows_loaded_total`, `..._rows_dropped_total`, and `..._errors_total` report the
 warming work, the `..._queue_batches` gauge its depth, and
-`flare_engram_table_prediction_mismatches_total` counts the steps whose published
-ids included a row the prediction missed: any nonzero value there means the host
-derivation disagrees with the graph, which is a defect and never a serving fault.
+`flare_engram_table_prediction_mismatches_total` counts the steps for which a row
+the host predicted was not among the ids the graph published. Each step checks one
+batch of each prefill lane's own positions and every decode lane's pending token;
+rows of graph-produced drafts are never predicted, so they cannot cause a mismatch.
+Any nonzero value means the host derivation disagrees with the graph, which is a
+defect and never a serving fault.
 `flare_engram_table_disk_queue_depth` and `..._queue_depth_requested` report the
 io_uring depth that actually landed after the locked-memory clamp and halving
 ladder, `..._alignment_bytes` the smallest per-file direct-I/O fragment floor
