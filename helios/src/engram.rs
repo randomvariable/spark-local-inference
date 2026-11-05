@@ -83,6 +83,29 @@ impl TableCounters {
             ..Default::default()
         })
     }
+
+    // Counter reads for the device delivery test, which observes the advisory
+    // path from outside this module; the serving path publishes these through
+    // `Stats::render` instead.
+    #[cfg(test)]
+    pub(crate) fn prefetch_rows(&self) -> u64 {
+        self.prefetch_rows.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefetch_rows_loaded(&self) -> u64 {
+        self.prefetch_rows_loaded.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disk_read_calls(&self) -> u64 {
+        self.disk_read_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prediction_mismatches(&self) -> u64 {
+        self.prediction_mismatches.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]
@@ -651,12 +674,13 @@ enum Work {
 ///
 /// A closed advisory channel is never a shutdown signal: real gathers may still be
 /// queued, and a thread that exited on it would strand the frame every rank is
-/// waiting on. With nothing ready the thread blocks on the submission channel
-/// alone, or polls briefly while `queued` advisory batches wait, so a batch handed
-/// over between steps is warmed without waiting for the next submission.
+/// waiting on. With nothing ready the thread blocks on the wake token, or polls
+/// briefly while `queued` advisory batches wait, so a batch handed over between
+/// steps is warmed without waiting for the next submission.
 fn next_work(
     receiver: &mpsc::Receiver<Job>,
     advisory: &mpsc::Receiver<Vec<i64>>,
+    wake: &mpsc::Receiver<()>,
     queued: u64,
 ) -> Work {
     match receiver.try_recv() {
@@ -668,10 +692,14 @@ fn next_work(
         return Work::Warm(ids);
     }
     if queued == 0 {
-        match receiver.recv() {
-            Ok(job) => Work::Gather(job),
-            Err(_) => Work::Stop,
-        }
+        // A send on the advisory channel cannot release a thread parked on the
+        // submission channel, so idleness is waited out on a token both producers
+        // post after enqueueing. The token stays in the channel until it is read,
+        // so a wake that races this park cannot be lost, and a closed wake channel
+        // only sends the thread back to re-probe, where a drained submission
+        // channel decides whether to stop.
+        wake.recv().ok();
+        Work::Wait
     } else {
         match receiver.recv_timeout(PREFETCH_POLL) {
             Ok(job) => Work::Gather(job),
@@ -688,6 +716,10 @@ struct Layer {
     /// dropped with the layer, but a closed advisory channel is never a reason
     /// for the thread to stop: real gathers may still be queued.
     prefetch: Option<mpsc::SyncSender<Vec<i64>>>,
+    /// Coalescing wake-up for the thread parked in `next_work`. Both producers
+    /// post one token after enqueueing; capacity one means a pending token makes
+    /// further posts free, and the queue's memory means a racing park still sees it.
+    wake: mpsc::SyncSender<()>,
     counters: Arc<TableCounters>,
     /// Rows one gather serves, the chunk bound for advisory batches.
     max_rows: usize,
@@ -704,6 +736,10 @@ impl Drop for Layer {
         self.cancelled.store(true, Ordering::Release);
         self.sender.take();
         self.prefetch.take();
+        // The thread waits on this token rather than on the submission channel, so
+        // closing the work senders does not release it by itself. Post one and let
+        // it re-probe: the drained, now-closed submission channel ends the loop.
+        let _ = self.wake.try_send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -839,6 +875,7 @@ impl Shared {
             let (prefetch_sender, prefetch_receiver) = mpsc::sync_channel::<Vec<i64>>(
                 PREFETCH_SLOTS as usize,
             );
+            let (wake_sender, wake_receiver) = mpsc::sync_channel::<()>(1);
             let counters = stats.table(ordinal).expect("one counter set per table");
             let buffers = staging.clone();
             let planes = table.planes;
@@ -861,6 +898,7 @@ impl Shared {
                         let job = match next_work(
                             &receiver,
                             &prefetch_receiver,
+                            &wake_receiver,
                             queued.prefetch_queue_batches.load(Ordering::Acquire),
                         ) {
                             Work::Gather(job) => job,
@@ -958,6 +996,7 @@ impl Shared {
                 cancelled,
                 sender: Some(sender),
                 prefetch: Some(prefetch_sender),
+                wake: wake_sender,
                 counters,
                 max_rows,
                 worker: Some(worker),
@@ -1131,12 +1170,15 @@ impl Shared {
                 .counters
                 .prefetch_rows
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            // Post after enqueueing, so a thread that parks between the probes
+            // still finds the token waiting. A pending token makes this free.
+            let _ = layer.wake.try_send(());
             accepted = true;
         }
         accepted
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn stats(&self) -> Arc<Stats> {
         self.stats.clone()
     }
@@ -1193,6 +1235,9 @@ impl Shared {
                     requests,
                 })
                 .map_err(|_| "Engram reader disconnected")?;
+            // Same reason as the advisory path: the token, not the queue, is what
+            // releases a thread parked between steps.
+            let _ = layer.wake.try_send(());
         }
         states[frame] = state;
         Ok((rows, state.generation))
@@ -1498,21 +1543,25 @@ mod tests {
     fn reader_thread_prefers_a_real_gather_over_advisory_warming() {
         let (sender, receiver) = mpsc::channel::<Job>();
         let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
+        let (_wake_sender, wake_receiver) = mpsc::channel::<()>();
         // Advisory work is queued first, so a priority inversion would show up here.
         advisory_sender.send(vec![7, 12]).unwrap();
         sender.send(job(1)).unwrap();
         assert!(
-            matches!(next_work(&receiver, &advisory_receiver, 1), Work::Gather(_)),
+            matches!(
+                next_work(&receiver, &advisory_receiver, &wake_receiver, 1),
+                Work::Gather(_)
+            ),
             "a submission must outrank a queued batch"
         );
         assert!(matches!(
-            next_work(&receiver, &advisory_receiver, 1),
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 1),
             Work::Warm(_)
         ));
         // Only a closed and drained submission channel ends the thread.
         drop(sender);
         assert!(matches!(
-            next_work(&receiver, &advisory_receiver, 0),
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
             Work::Stop
         ));
     }
@@ -1521,17 +1570,18 @@ mod tests {
     fn a_closed_advisory_channel_is_never_a_shutdown_signal() {
         let (sender, receiver) = mpsc::channel::<Job>();
         let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
+        let (_wake_sender, wake_receiver) = mpsc::channel::<()>();
         sender.send(job(3)).unwrap();
         // Dropping the advisory sender with real work still queued must not end the
         // thread: a graph would wait forever on the frame that work publishes.
         drop(advisory_sender);
         assert!(matches!(
-            next_work(&receiver, &advisory_receiver, 0),
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
             Work::Gather(_)
         ));
         drop(sender);
         assert!(matches!(
-            next_work(&receiver, &advisory_receiver, 0),
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
             Work::Stop
         ));
     }
@@ -1540,11 +1590,51 @@ mod tests {
     fn a_parked_reader_wakes_for_a_submission() {
         let (sender, receiver) = mpsc::channel::<Job>();
         let (_, advisory_receiver) = mpsc::channel::<Vec<i64>>();
-        // A Receiver is not shareable, so the parked thread owns both channels.
-        let parked = thread::spawn(move || next_work(&receiver, &advisory_receiver, 0));
-        // The thread is blocked in the receive when the submission arrives.
+        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
+        // A Receiver is not shareable, so the parked thread owns every channel.
+        let parked = thread::spawn(move || {
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0)
+        });
+        // `Shared::start` enqueues the job and then posts the token, which is what
+        // releases a thread blocked between steps.
         sender.send(job(9)).unwrap();
+        wake_sender.send(()).unwrap();
         assert!(matches!(parked.join().unwrap(), Work::Gather(job) if job.sequence == 9));
+    }
+
+    #[test]
+    fn a_parked_reader_wakes_for_an_advisory_batch() {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let (advisory_sender, advisory_receiver) = mpsc::channel::<Vec<i64>>();
+        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
+        let parked = thread::spawn(move || {
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0)
+        });
+        // `Shared::prefetch` touches only the advisory channel and the token. A
+        // thread parked on the submission channel alone never sees it, and then the
+        // step the batch was meant to warm still waits on the disk.
+        advisory_sender.send(vec![4, 5]).unwrap();
+        wake_sender.send(()).unwrap();
+        assert!(
+            matches!(parked.join().unwrap(), Work::Warm(ids) if ids == vec![4, 5]),
+            "an idle reader must warm the rows predicted for the next step"
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn a_stray_wake_token_reprobes_instead_of_stopping() {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let (_, advisory_receiver) = mpsc::channel::<Vec<i64>>();
+        let (wake_sender, wake_receiver) = mpsc::channel::<()>();
+        // Coalescing means a token can be posted with nothing behind it, or already
+        // consumed by a competing wake. Either way the thread re-probes and stays.
+        wake_sender.send(()).unwrap();
+        assert!(matches!(
+            next_work(&receiver, &advisory_receiver, &wake_receiver, 0),
+            Work::Wait
+        ));
+        drop(sender);
     }
 
     #[cfg(feature = "server")]
