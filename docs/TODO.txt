@@ -147,6 +147,14 @@
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
 
+[ ] Measure advisory embedding-row prefetch on an NVIDIA device: ring depth and
+    fragment floor actually registered, row-cache hit rate and gather delay with
+    `--embedding-table-prefetch` against `--no-embedding-table-prefetch`, and
+    `flare_engram_table_prediction_mismatches_total` staying zero for Qwen PLE and
+    DeepSeek Engram. No device was available when the port landed, so the
+    enabled-by-default setting is unmeasured. See helios/src/engram.rs,
+    helios/src/engram/row_ids.rs, and verification/helios-lifecycle/README.md.
+
 [ ] Measure cross-host rank handoff polling and completion yielding: CPU time,
     request p99, and complete-round latency under active and idle workloads.
     See helios/src/execution/parallel.rs and performance-work.md.

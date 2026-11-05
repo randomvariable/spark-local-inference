@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     Result,
-    engram::{Index, Plane, Table},
+    engram::{Index, Plane, RowGeometry, RowMethod, Table},
 };
 use std::collections::HashSet;
 
@@ -171,14 +171,19 @@ pub(super) fn decode<F: super::payload::Files>(
         {
             return Err(invalid("invalid Engram hash geometry"));
         }
-        let (stored_rows, weights, scales) = if table.shards.is_empty() {
-            (table.rows, table.weights.clone(), table.scales.clone())
+        let (stored_rows, first_row, weights, scales) = if table.shards.is_empty() {
+            (table.rows, 0, table.weights.clone(), table.scales.clone())
         } else {
             let shard = table
                 .shards
                 .get(rank)
                 .ok_or_else(|| invalid("embedding partition rank is absent"))?;
-            (shard.rows, shard.weights.clone(), shard.scales.clone())
+            (
+                shard.rows,
+                shard.first_row,
+                shard.weights.clone(),
+                shard.scales.clone(),
+            )
         };
         let plane = |span: Option<wire::Span>, row_bytes: usize| -> Result<Plane> {
             let span = span.ok_or_else(|| invalid("Engram table lacks a payload plane"))?;
@@ -282,8 +287,21 @@ pub(super) fn decode<F: super::payload::Files>(
             }
         }
         tables.push(Table {
+            layer: table.layer,
             planes,
             heads: geometry.primes.len(),
+            rows: stored_rows,
+            first_row,
+            geometry: RowGeometry {
+                method: match wire::engram_hash::Method::try_from(geometry.method) {
+                    Ok(wire::engram_hash::Method::XorModulo) => RowMethod::XorModulo,
+                    _ => RowMethod::EosXorModulo,
+                },
+                orders: geometry.orders,
+                multipliers: geometry.multipliers,
+                primes: geometry.primes,
+                offsets: geometry.offsets,
+            },
             weights: table.weight_buffer,
             scales: table.scale_buffer,
             hashes: table.hash_buffer,
@@ -291,7 +309,11 @@ pub(super) fn decode<F: super::payload::Files>(
             request: gpu.then_some(table.request_buffer),
         });
     }
-    Ok(Index { tables })
+    Ok(Index {
+        tables,
+        token_map: value.token_map,
+        pad_token_id: value.pad_token_id,
+    })
 }
 
 #[cfg(test)]

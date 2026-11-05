@@ -457,6 +457,13 @@ impl NativeModel {
         let staging_bytes = engram.iter().zip(&engram_tokens).try_fold(0u64,
             |total, ((index, _), tokens)| total.checked_add(crate::engram::staging_bytes(index, *tokens)?)
                 .ok_or_else(|| invalid("embedding staging exceeds the memory budget")))?;
+        // The disk readers' fragment and read tables are reserved with the rest of
+        // the embedding host memory, never out of a configured row-cache budget.
+        let planning_bytes = engram
+            .iter()
+            .zip(&engram_tokens)
+            .map(|((index, _), tokens)| crate::engram::planning_bytes(index, *tokens))
+            .sum::<u64>();
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
@@ -661,8 +668,11 @@ impl NativeModel {
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
             );
+            let embedding_table_prefetch =
+                options.embedding_prefetch(!engram.is_empty(), embedding_table_cache_bytes);
             let embedding_host_bytes = resident_bytes
                 .checked_add(staging_bytes)
+                .and_then(|bytes| bytes.checked_add(planning_bytes))
                 .and_then(|bytes| bytes.checked_add(embedding_table_cache_bytes))
                 .ok_or_else(|| {
                     invalid("embedding tables, staging, and row cache exceed the memory budget")
@@ -745,6 +755,7 @@ impl NativeModel {
                         group_budget,
                         options.embedding_workers(),
                         embedding_table_resident_scales,
+                        embedding_table_prefetch,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
@@ -772,8 +783,13 @@ impl NativeModel {
                     label.to_owned()
                 } else {
                     format!(
-                        "{label} · {:.0} MiB row cache",
-                        cache_bytes as f64 / (1u64 << 20) as f64
+                        "{label} · {:.0} MiB row cache{}",
+                        cache_bytes as f64 / (1u64 << 20) as f64,
+                        if embedding_table_prefetch {
+                            " · advisory prefetch"
+                        } else {
+                            ""
+                        }
                     )
                 });
             }

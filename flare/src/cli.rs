@@ -861,6 +861,23 @@ pub struct ServingOptions {
     )]
     pub no_embedding_table_resident_scales: bool,
 
+    /// Predict the rows the launching step will request and warm them through the reader thread
+    /// while the previous step replays [default: enabled for disk tables with a row cache].
+    #[arg(
+        long,
+        overrides_with = "no_embedding_table_prefetch",
+        help_heading = "Serving options"
+    )]
+    pub embedding_table_prefetch: bool,
+
+    /// Read embedding rows only when the graph requests them.
+    #[arg(
+        long,
+        overrides_with = "embedding_table_prefetch",
+        help_heading = "Serving options"
+    )]
+    pub no_embedding_table_prefetch: bool,
+
     /// Disk workers per embedding table; shares a fixed I/O budget [default: 4 on Windows, 1 elsewhere].
     #[arg(long, value_name = "N", help_heading = "Advanced serving options",
         value_parser = PossibleValuesParser::new(["1", "2", "4", "8"]).map(|value| value.parse::<usize>().unwrap()))]
@@ -1086,6 +1103,12 @@ impl ServingOptions {
         if self.no_embedding_table_resident_scales {
             options.push("--no-embedding-table-resident-scales".into());
         }
+        if self.embedding_table_prefetch {
+            options.push("--embedding-table-prefetch".into());
+        }
+        if self.no_embedding_table_prefetch {
+            options.push("--no-embedding-table-prefetch".into());
+        }
         // Every rank keeps its own records under its host's directory; rank zero's store drives
         // all of them, so every rank needs the same settings.
         if let Some(bytes) = self.prefix_cache_memory {
@@ -1138,6 +1161,13 @@ impl ServingOptions {
                 None
             },
             embedding_table_workers: self.embedding_table_workers,
+            embedding_table_prefetch: if self.embedding_table_prefetch {
+                Some(true)
+            } else if self.no_embedding_table_prefetch {
+                Some(false)
+            } else {
+                None
+            },
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
             history_drafts: if self.history_drafts {
@@ -2089,6 +2119,36 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    #[test]
+    fn embedding_row_prefetch_overrides_reach_every_rank() {
+        let enable = "--embedding-table-prefetch";
+        let disable = "--no-embedding-table-prefetch";
+        for (flags, expected) in [
+            (vec![disable], false),
+            (vec![enable, disable], false),
+            (vec![disable, enable], true),
+        ] {
+            let mut argv = vec!["flare", "run", "model.safetensors"];
+            argv.extend(flags);
+            let args = run(&argv);
+            assert_eq!(args.load_options().embedding_table_prefetch, Some(expected));
+            let forwarded = args.rank_options();
+            let mut peer_argv = vec!["flare", "run", "model.safetensors"];
+            peer_argv.extend(forwarded.iter().map(String::as_str));
+            assert_eq!(
+                run(&peer_argv).load_options().embedding_table_prefetch,
+                Some(expected)
+            );
+        }
+        // Omitted defers to the hardware and cache defaults.
+        assert_eq!(
+            run(&["flare", "run", "model.safetensors"])
+                .load_options()
+                .embedding_table_prefetch,
+            None
+        );
     }
 
     #[test]

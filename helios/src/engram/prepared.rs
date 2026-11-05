@@ -6,7 +6,7 @@
 
 //! Immutable resident tables shared across preparation-owned rank processes.
 
-use super::{Binding, Index, Plane, Shared, Table, reader};
+use super::{Binding, Index, Plane, Shared, Storage, Table, reader};
 use crate::{
     Result,
     execution::{Dtype, ExecutionManifest},
@@ -37,6 +37,9 @@ pub struct PlaneSource {
 /// Table geometry and the prepared buffers consumed by native row delivery.
 #[derive(Clone, Debug)]
 pub struct TableSource {
+    /// Declared layer this table serves. Labels delivery metrics and selects the
+    /// per-layer row-addressing geometry.
+    pub layer: u32,
     pub planes: [PlaneSource; 2],
     pub heads: usize,
     pub weights: String,
@@ -116,8 +119,14 @@ impl PreparedTables {
                 });
             }
             tables.push(Table {
+                layer: source.layer,
                 planes: [planes[0], planes[1]],
                 heads: source.heads,
+                // Resident preparation never predicts rows, so it carries no
+                // declared addressing: the loader has no package to read one from.
+                rows: (planes[0].nbytes / planes[0].row_bytes) as u64,
+                first_row: 0,
+                geometry: Default::default(),
                 weights: source.weights.clone(),
                 scales: source.scales.clone(),
                 hashes: source.hashes.clone(),
@@ -125,7 +134,11 @@ impl PreparedTables {
                 request: source.request.clone(),
             });
         }
-        Ok(Arc::new(Index { tables }))
+        Ok(Arc::new(Index {
+            tables,
+            token_map: Vec::new(),
+            pad_token_id: 0,
+        }))
     }
 
     /// Load checkpoint spans once into sealed RAM-backed files. Serving never
@@ -273,7 +286,9 @@ impl PreparedTables {
                 return Err("prepared embedding graph lacks its hash input binding".into());
             }
         }
-        let stats = Arc::new(super::Stats::default());
+        let stats = Arc::new(super::Stats::with_tables(
+            self.index.tables.iter().map(|table| table.layer),
+        ));
         let readers = self
             .data
             .iter()
@@ -288,6 +303,8 @@ impl PreparedTables {
                 manifest.context,
                 manifest.device,
                 stats,
+                Storage::Ram,
+                false,
             )?,
             rank: 0,
             events: handles,
@@ -311,6 +328,7 @@ mod tests {
         std::fs::write(&first, &weights).unwrap();
         std::fs::write(&second, &scales).unwrap();
         let sources = [TableSource {
+            layer: 1,
             planes: [
                 PlaneSource {
                     segments: vec![

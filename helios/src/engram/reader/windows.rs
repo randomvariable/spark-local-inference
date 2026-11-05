@@ -6,7 +6,7 @@
 
 //! Windows disk readers share a fixed staging and queue budget across workers.
 
-use super::{Aligned, CHUNK, DEPTH, DiskTimings, Fragment, Read, Stats};
+use super::{Aligned, CHUNK, DEPTH, DiskTimings, Fragment, Read, TableCounters};
 use crate::{Result, os::ioring::ReadRing};
 use std::{
     fs::File,
@@ -80,7 +80,7 @@ impl Readers {
         reads: &[Read],
         fragments: &[Fragment],
         output: &mut [u8],
-        stats: &Stats,
+        stats: &TableCounters,
     ) -> Result<()> {
         let output = Output {
             address: output.as_mut_ptr() as usize,
@@ -125,7 +125,7 @@ impl Lane {
         reads: &[Read],
         fragments: &[Fragment],
         output: Output,
-        stats: &Stats,
+        stats: &TableCounters,
     ) -> Result<()> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.read(reads, fragments, output, stats)
@@ -142,7 +142,7 @@ impl Lane {
         reads: &[Read],
         fragments: &[Fragment],
         output: Output,
-        stats: &Stats,
+        stats: &TableCounters,
     ) -> Result<()> {
         let mut timing = DiskTimings {
             stats,
@@ -251,7 +251,7 @@ mod tests {
                 .collect();
             let mut baseline_reads = None;
             for workers in [1, 2, 4, 8] {
-                let stats = Arc::new(Stats::default());
+                let stats = Arc::new(TableCounters::default());
                 let file = Arc::new(File::open(&path).unwrap());
                 let mut reader = Reader::from_files(
                     std::slice::from_ref(&file),
@@ -259,6 +259,7 @@ mod tests {
                     false,
                     0,
                     ids.len(),
+                    Arc::default(),
                     stats.clone(),
                     workers,
                     false,
@@ -356,10 +357,19 @@ mod tests {
                 .iter()
                 .map(|path| Arc::new(open_file(path).unwrap()))
                 .collect();
-            let stats = Arc::new(Stats::default());
-            let mut reader =
-                Reader::from_files(&files, &planes, false, 0, ids.len(), stats.clone(), workers, false)
-                    .unwrap();
+            let stats = Arc::new(TableCounters::default());
+            let mut reader = Reader::from_files(
+                &files,
+                &planes,
+                false,
+                0,
+                ids.len(),
+                Arc::default(),
+                stats.clone(),
+                workers,
+                false,
+            )
+            .unwrap();
             drop(files);
             let check = |reader: &mut Reader, ids: &[i64]| {
                 let mut expected = Vec::new();

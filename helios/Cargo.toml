@@ -65,6 +65,7 @@ twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64
 flare-selene = { path = "../selene", features = ["test-support"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+proptest = "1.12.0"
 
 [target.'cfg(unix)'.dev-dependencies]
 flare-selene-manager = { path = "../selene-manager", features = ["test-support"] }

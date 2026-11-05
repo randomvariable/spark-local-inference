@@ -44,6 +44,7 @@ fn sources(value: &Bound<'_, PyAny>) -> PyResult<(usize, Vec<TableSource>)> {
             ));
         }
         tables.push(TableSource {
+            layer: table.get_item("layer")?.extract()?,
             planes: [planes.remove(0), planes.remove(0)],
             heads: table.get_item("heads")?.extract()?,
             weights: table.get_item("weights")?.extract()?,

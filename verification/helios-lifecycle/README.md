@@ -6,7 +6,8 @@ Early reuse can corrupt another request's state.
 Rank-control checks cover readiness and completion predicates guarding
 tensor-parallel submission and queue removal.
 Additional checks cover prefix-checkpoint ownership, speculative scheduling
-arithmetic, snapshot backing aliases, and multi-rank offload reply aggregation.
+arithmetic, snapshot backing aliases, multi-rank offload reply aggregation, and
+embedding row delivery with its advisory prefetch channel.
 
 ## Run the check
 
@@ -37,8 +38,9 @@ then reruns the unmodified implementation and its TLA+ conformance check.
 It also checks that premature cancellation release in a temporary copy of the
 model violates `QueuedReferencesRetainOwnership`.
 Additional model faults check early rank commitment, early queue removal, and
-ownership release after partial dispatch failure, lost inherited fences, and
-speculative pending bounds.
+ownership release after partial dispatch failure, lost inherited fences,
+speculative pending bounds, and the embedding reader's priority guard, exit
+condition, and generation publication.
 
 ## Scheduler ownership
 
@@ -207,6 +209,42 @@ aggregate count, error and bytes, followed by rank outstanding counts and active
 rank count. Duplicate in-flight submission and empty polling are checked too.
 CUDA copies, physical slab ownership, worker channel lifetimes, shutdown drain,
 and scheduler cancellation require their separate contracts and execution tests.
+
+## Embedding row delivery
+
+`EngramDelivery.tla` checks one disk-backed embedding table: the two staging frames
+fenced by tensor-parallel rank bitmasks, the bounded submission channel the reader
+thread serves first, and the bounded advisory prefetch channel that warms the host
+row cache without owning a frame. Two ranks, two frames, two queue slots each, four
+submission sequences, two row counts, and three advisory offers explore 3.7 million
+distinct states to depth 37.
+
+Safety invariants require that a frame is reused only after every rank retired its
+previous occupant and its rows were published, that exactly one gather job exists
+per frame generation, that a queued or in-flight job names the generation its frame
+holds, that a published value is always that frame's own generation, that a rank
+never retires before publication, and that the reader thread exits only with an
+empty, closed submission channel. Advisory work is checked never to begin while a
+gather waits and never to hold a job.
+
+Liveness is checked as a temporal property under fairness on the worker actions and
+on thread exit: every queued gather is eventually published and the system settles,
+every accepted advisory batch is either warmed or dropped by a shutdown, and a
+thread whose channels are closed is eventually joined. Removing the reader's
+priority guard, letting the thread exit on an advisory-channel close, or letting an
+advisory batch publish a generation each violates a named invariant; the `--mutations`
+runner requires all three detections.
+
+Correspondence is by name rather than a projection harness, because the modelled
+protocol spans three parties: `State::prepare`/`State::finish` and their rejection
+messages, `Shared::start`'s blocking `SyncSender::send`, `Transfers::enqueue`'s
+`wait_value` on the frame's ready word, `next_work`'s channel selection, and
+`Layer::Drop`. `engram::tests` reproduce the load-bearing cases against real channels
+and a real parked thread: `reader_thread_prefers_a_real_gather_over_advisory_warming`,
+`a_closed_advisory_channel_is_never_a_shutdown_signal`, and
+`a_parked_reader_wakes_for_a_submission`. The staged frames themselves, CUDA stream
+waits, disk reads, and rank retirement are covered by the GPU-gated
+`runtime_package::event_tests` sweep, not by this model.
 
 ## Assumptions and limits
 

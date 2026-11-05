@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn rank_layout_accepts_shared_and_partitioned_engram_delivery() {
-        use crate::engram::{Binding, Index, Plane, Shared, Table};
+        use crate::engram::{Binding, Index, Plane, RowGeometry, Shared, Table};
 
         for partitioned in [false, true] {
             let groups: Vec<_> = (0..if partitioned { 4 } else { 1 })
@@ -665,6 +665,7 @@ mod tests {
                     Shared::layout_fixture(
                         Index {
                             tables: vec![Table {
+                                layer: 1,
                                 planes: [256, 8].map(|row_bytes| Plane {
                                     file: rank,
                                     offset: rank as u64 * 4096,
@@ -672,12 +673,17 @@ mod tests {
                                     row_bytes,
                                 }),
                                 heads: 24,
+                                rows: 100 + rank as u64,
+                                first_row: 0,
+                                geometry: RowGeometry::default(),
                                 weights: "weights".into(),
                                 scales: "scales".into(),
                                 hashes: "hashes".into(),
                                 event: "ready".into(),
                                 request: Some("requests".into()),
                             }],
+                            token_map: Vec::new(),
+                            pad_token_id: 0,
                         },
                         if partitioned { 1 } else { 4 },
                     )
@@ -722,7 +728,7 @@ mod tests {
     #[test]
     fn tp4_catalog_accepts_shared_and_partitioned_embedding_delivery() {
         use super::super::{BufferDescriptor, Dtype, GraphKind, InputBinding};
-        use crate::engram::{Binding, Index, Plane, Shared, Table};
+        use crate::engram::{Binding, Index, Plane, RowGeometry, Shared, Table};
 
         for logprobs in [false, true] {
             let mut root = if logprobs {
@@ -772,14 +778,21 @@ mod tests {
 
             for partitioned in [false, true] {
                 let groups: Vec<_> = (0..if partitioned { 4 } else { 1 }).map(|rank| {
-                    Shared::layout_fixture(Index { tables: vec![Table {
-                        planes: [256, 8].map(|row_bytes| Plane {
-                            file: rank, offset: rank as u64 * 4096,
-                            nbytes: (100 + rank) * row_bytes, row_bytes,
-                        }),
-                        heads: 24, weights: "weights".into(), scales: "scales".into(),
-                        hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
-                    }] }, if partitioned { 1 } else { 4 })
+                    Shared::layout_fixture(Index {
+                        tables: vec![Table {
+                            layer: 1,
+                            planes: [256, 8].map(|row_bytes| Plane {
+                                file: rank, offset: rank as u64 * 4096,
+                                nbytes: (100 + rank) * row_bytes, row_bytes,
+                            }),
+                            heads: 24, rows: 100 + rank as u64, first_row: 0,
+                            geometry: RowGeometry::default(),
+                            weights: "weights".into(), scales: "scales".into(),
+                            hashes: "hashes".into(), event: "ready".into(), request: Some("requests".into()),
+                        }],
+                        token_map: Vec::new(),
+                        pad_token_id: 0,
+                    }, if partitioned { 1 } else { 4 })
                 }).collect();
                 let ranks: Vec<_> = (0..4).map(|rank| {
                     let mut manifest = root.clone();

@@ -21,7 +21,7 @@ CHECKS = [("Lifecycle", TEST, "LIFECYCLE_EDGE ", 14),
            "CACHE_OWNERSHIP_EDGE ", 29),
           ("Speculation", "scheduler::speculative_lifecycle_tests::scheduler_matches_speculative_accounting_model",
            "SPECULATION_EDGE ", 6)]
-MODELS = [check[0] for check in CHECKS] + ["RankDispatch"]
+MODELS = [check[0] for check in CHECKS] + ["RankDispatch", "EngramDelivery"]
 
 
 def run(command, *, cwd=ROOT):
@@ -137,9 +137,11 @@ def main():
                          for suffix in ["tla", "cfg"]]:
             shutil.copyfile(MODEL / filename, directory / filename)
         shutil.copyfile(MODEL / "Speculation16.cfg", directory / "Speculation16.cfg")
+        shutil.copyfile(MODEL / "EngramDeliveryLive.cfg", directory / "EngramDeliveryLive.cfg")
         for module in MODELS:
             run(tlc(args.java, jar, directory, module), cwd=directory)
         run(tlc(args.java, jar, directory, "Speculation", "Speculation16.cfg"), cwd=directory)
+        run(tlc(args.java, jar, directory, "EngramDelivery", "EngramDeliveryLive.cfg"), cwd=directory)
         cargo = ["cargo", "test", "--locked", "--manifest-path", "helios/Cargo.toml", "--lib"]
         if args.target_dir:
             cargo.extend(["--target-dir", str(args.target_dir.resolve())])
@@ -168,6 +170,27 @@ def main():
                  "!.nodes[child][6] = U(before, child)]", "InheritedLastUse"),
                 ("Speculation", "Advance(st, ceiling) == Min(ceiling, Geometry(st)[7])",
                  "Advance(st, ceiling) == ceiling", "PendingUsesPhysicalCapacity"),
+                ("EngramDelivery",
+                 "    /\\ Len(before.queue) = 0\n    /\\ before.advisoryPending # 0\n"
+                 "    /\\ after = [before EXCEPT\n          !.worker = Advisory,\n"
+                 "          !.entryBacklog = (Len(before.queue) # 0),",
+                 "    /\\ before.advisoryPending # 0\n"
+                 "    /\\ after = [before EXCEPT\n          !.worker = Advisory,\n"
+                 "          !.entryBacklog = TRUE,",
+                 "NoAdvisoryUnderRealBacklog"),
+                ("EngramDelivery",
+                 "    /\\ before.realClosed\n    /\\ Len(before.queue) = 0\n"
+                 "    /\\ after = [before EXCEPT !.exited = TRUE, !.parked = FALSE]",
+                 "    /\\ TRUE\n"
+                 "    /\\ after = [before EXCEPT !.exited = TRUE, !.parked = FALSE]",
+                 "ExitedOnlyWhenDrained"),
+                ("EngramDelivery",
+                 "    /\\ after = [before EXCEPT !.worker = Idle, !.entryBacklog = FALSE]",
+                 "    /\\ after = [before EXCEPT !.worker = Idle, !.entryBacklog = FALSE,\n"
+                 "          !.published = [f \\in Frames |->\n"
+                 "                            IF f = 0 THEN before.generation[f] + 1\n"
+                 "                            ELSE before.published[f]]]",
+                 "PublishedIsCurrentGeneration"),
             ]:
                 check_model_mutation(directory, args.java, jar, module, needle, replacement, invariant)
             check_mutations(cargo, ROOT / "helios/src/scheduler.rs", TEST, [

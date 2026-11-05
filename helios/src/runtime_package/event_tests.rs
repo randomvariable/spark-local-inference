@@ -153,6 +153,9 @@ fn disk_cached_and_resident_tables_feed_native_b12x_graphs() {
             cache_bytes,
             1,
             resident_scales,
+            // The sweep covers both the cached and uncached readers; prefetch
+            // follows the cache, exactly as the loader default does.
+            storage == crate::engram::Storage::Disk && cache_bytes != 0,
         )
         .unwrap();
         assert!(shared.cache_bytes() <= cache_bytes);

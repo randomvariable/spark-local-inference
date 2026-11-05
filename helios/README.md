@@ -519,8 +519,18 @@ table rows shared across requests; they copy into existing pinned row staging,
 whose consumer fences remain unchanged. Approximate usage counts protect frequently
 requested rows; recency breaks ties, and periodic count decay adapts to workload
 changes. Each server start creates an empty row cache; request gathers populate
-it without persistent cache files. `/metrics` exposes `flare_engram_` gather
-time, disk traffic, cache hits, misses, evictions, occupancy, capacity and bytes.
+it without persistent cache files. A disk gather splits each row at the file's
+own direct-I/O fragment floor, which `statx` reports per table file and falls back
+to 4 KiB, merges runs of consecutive blocks into one read, and submits a whole
+wave per `io_uring_enter` while keeping the ring's slots refilled from every reap.
+The ring comes up at 256 slots by default, clamped by the locked-memory budget and
+then halved on refusal, so the depth that landed is reported rather than assumed.
+`/metrics` exposes `flare_engram_` gather time, disk traffic, cache hits, misses,
+evictions, occupancy, capacity and bytes, both as host-wide totals and as one
+labelled `flare_engram_table_*` series per table and declared layer, including the
+reader's queue depth, fragment floor, accepted setup flags, and registered-file
+state. The same cache is warmed ahead of a step by advisory prefetch; see
+[the serving option](../docs/cli-design.md) for its counters and limits.
 
 ## Prefix checkpoint policy
 

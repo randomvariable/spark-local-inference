@@ -660,6 +660,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` / `--no-embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Enabled on discrete GPUs; disabled on unified-memory GPUs |
+| `--embedding-table-prefetch` / `--no-embedding-table-prefetch` | Predict the rows the launching step will request and warm them through the reader thread while the previous step replays | Enabled for disk tables with a row cache |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
 probability `p` as `sqrt(p)` when choosing complete speculative programs
@@ -701,6 +702,40 @@ budget. This option works with existing packages and requires disk table storage
 RAM table storage already retains both planes. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
+
+`--embedding-table-prefetch` asks each table's reader thread to fetch the rows the
+step about to be launched will request, from the host-side token window, while the
+previous step still replays. The prediction uses only the addressing the package
+declares (`EngramHash.method`, `orders`, `multipliers`, `primes`, `offsets`, and the
+`Engram` `token_map`, `pad_token_id` and `compressed_vocabulary`), so no recipe or
+model identity reaches the runtime. It is advisory: the captured graph remains the
+authority, it publishes the ids its own lookup consumes, and the real gather reads
+them whether or not the prediction was right. Prefetch never allocates GPU memory,
+never enters a graph, and never takes a staging frame; it fills the same bounded
+host row cache that a request gather warms. A batch that finds the reader's bounded
+advisory queue full is discarded, and every reader thread serves a real submission
+before any advisory batch, so prefetch cannot delay a step. The option is refused
+for `--embedding-table-storage ram`, and no prefetching happens when the row cache
+is disabled. Only the prompt positions of a prefill lane and the pending token of a
+decode, speculative, or mixed lane are predictable from host state: drafts beyond
+that pending token are produced inside the graph, so those rows are requested the
+ordinary way.
+
+`flare_engram_prefetch_submissions_total` and
+`flare_engram_prefetch_dropped_submissions_total` count the steps whose predicted
+rows were handed over and the steps whose batches found the queue full;
+`flare_engram_prefetch_enabled` separates a disabled prefetcher from one that is
+keeping up. Per table, `flare_engram_table_prefetch_rows_total`,
+`..._rows_loaded_total`, `..._rows_dropped_total`, and `..._errors_total` report the
+warming work, the `..._queue_batches` gauge its depth, and
+`flare_engram_table_prediction_mismatches_total` counts the steps whose published
+ids included a row the prediction missed: any nonzero value there means the host
+derivation disagrees with the graph, which is a defect and never a serving fault.
+`flare_engram_table_disk_queue_depth` and `..._queue_depth_requested` report the
+io_uring depth that actually landed after the locked-memory clamp and halving
+ladder, `..._alignment_bytes` the smallest per-file direct-I/O fragment floor
+`statx` reported, `..._uring_flags` the accepted `IORING_SETUP_*` bits, and
+`..._fixed_files` whether registered descriptors are in use.
 
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as

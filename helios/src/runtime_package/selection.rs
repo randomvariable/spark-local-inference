@@ -24,7 +24,11 @@ pub struct LoadOptions {
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
     /// When absent, enabled for disk tables on discrete GPUs.
     pub embedding_table_resident_scales: Option<bool>,
-    /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
+    /// Predict the rows the launching step will request and warm them through the
+    /// reader thread while the previous step replays. When absent, enabled for
+    /// disk tables whose row cache is enabled.
+    pub embedding_table_prefetch: Option<bool>,
+    /// Disk workers per table: four on Windows, one elsewhere. Windows workers share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
     pub mtp_draft_tokens: Option<usize>,
@@ -66,6 +70,15 @@ impl LoadOptions {
         })
     }
 
+    /// Advisory prefetch needs disk storage and a cache to warm, so it follows the
+    /// same hardware default as the cache itself.
+    pub(super) fn embedding_prefetch(&self, has_tables: bool, cache_bytes: u64) -> bool {
+        has_tables
+            && cache_bytes != 0
+            && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            && self.embedding_table_prefetch.unwrap_or(true)
+    }
+
     pub(super) fn select(&self, packages: &mut [Package], config: &mut Value) -> Result<usize> {
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
@@ -101,6 +114,13 @@ impl LoadOptions {
         {
             return Err(invalid(
                 "resident embedding scales require disk table storage; RAM storage already retains all planes",
+            ));
+        }
+        if self.embedding_table_prefetch == Some(true)
+            && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
+        {
+            return Err(invalid(
+                "embedding row prefetch requires disk table storage; RAM storage never reads the disk",
             ));
         }
         let execution = packages
@@ -755,6 +775,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("resident embedding scales require disk table storage")
+        );
+    }
+
+    #[test]
+    fn row_prefetch_follows_the_cache_and_rejects_whole_table_ram() {
+        let options = LoadOptions {
+            embedding_table_cache_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        // Enabled by default for a disk catalog with a row cache to warm.
+        assert!(options.embedding_prefetch(true, 1 << 30));
+        assert!(!options.embedding_prefetch(false, 1 << 30), "no catalog to warm");
+        assert!(!options.embedding_prefetch(true, 0), "no cache to warm");
+        let disabled = LoadOptions {
+            embedding_table_prefetch: Some(false),
+            ..Default::default()
+        };
+        assert!(!disabled.embedding_prefetch(true, 1 << 30));
+        // An explicit request against RAM tables is refused: nothing is read.
+        let error = LoadOptions {
+            embedding_table_storage: Some(crate::engram::Storage::Ram),
+            embedding_table_prefetch: Some(true),
+            ..Default::default()
+        }
+        .select(&mut [package()], &mut config())
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("embedding row prefetch requires disk table storage"),
+            "{error}"
         );
     }
 
